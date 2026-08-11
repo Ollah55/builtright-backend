@@ -49,6 +49,7 @@ const userSchema = new mongoose.Schema(
       invitationToken: { type: String, default: "" },
       invitationExpiresAt: { type: Date, default: null },
       invitedAt: { type: Date, default: null },
+      invitationEmailSentAt: { type: Date, default: null },
       activatedAt: { type: Date, default: null },
     },
   },

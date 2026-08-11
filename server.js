@@ -91,6 +91,21 @@ const safeHtml = (value = "") => String(value)
 
 const formatNaira = (amount) => `₦${Number(amount || 0).toLocaleString("en-NG", { maximumFractionDigits: 0 })}`;
 
+const sendInstallerInviteEmail = async (user, rawToken) => {
+  const activationUrl = `${frontendUrl()}/installer/activate?token=${rawToken}`;
+  try {
+    await sendEmail({
+      to: user.email,
+      subject: "Welcome to BuiltRight Installer Operations",
+      html: `<h2>Welcome to BuiltRight</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your installer account is ready. Set a secure password to access your assignments, schedule inspections, complete load audits, and submit installation-material requirements.</p><p><a href="${activationUrl}">Activate your installer account</a></p><p>This secure invitation expires in 7 days.</p>`,
+    });
+    user.installerProfile.invitationEmailSentAt = new Date();
+    await user.save();
+  } catch (mailError) {
+    console.error("INSTALLER INVITE EMAIL ERROR:", mailError.message);
+  }
+};
+
 const makeInstallerInvite = async (installer) => {
   const rawToken = crypto.randomBytes(32).toString("hex");
   const temporaryPassword = crypto.randomBytes(24).toString("base64url");
@@ -108,23 +123,24 @@ const makeInstallerInvite = async (installer) => {
       invitedAt: new Date(),
     },
   });
-  const activationUrl = `${frontendUrl()}/installer/activate?token=${rawToken}`;
-  try {
-    await sendEmail({
-      to: user.email,
-      subject: "Welcome to BuiltRight Installer Operations",
-      html: `<h2>Welcome to BuiltRight</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your installer account is ready. Set a secure password to access your assignments, schedule inspections, complete load audits, and submit installation-material requirements.</p><p><a href="${activationUrl}">Activate your installer account</a></p><p>This secure invitation expires in 7 days.</p>`,
-    });
-  } catch (mailError) {
-    console.error("INSTALLER INVITE EMAIL ERROR:", mailError.message);
-  }
+  await sendInstallerInviteEmail(user, rawToken);
   return user;
 };
 
 const provisionInitialInstallers = async () => {
   for (const installer of initialInstallers) {
     const existing = await User.findOne({ email: installer.email });
-    if (!existing) await makeInstallerInvite(installer);
+    if (!existing) {
+      await makeInstallerInvite(installer);
+    } else if (
+      existing.role === "installer" &&
+      !existing.isActive &&
+      existing.installerProfile?.invitationToken &&
+      existing.installerProfile?.invitationExpiresAt > new Date() &&
+      !existing.installerProfile?.invitationEmailSentAt
+    ) {
+      await sendInstallerInviteEmail(existing, existing.installerProfile.invitationToken);
+    }
   }
 };
 
