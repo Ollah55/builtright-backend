@@ -16,7 +16,10 @@ const userSchema = new mongoose.Schema(
     },
     phone: {
       type: String,
-      required: true,
+      required: function requiresPhone() {
+        return this.role === "customer";
+      },
+      default: "",
       trim: true,
     },
     location: {
@@ -30,8 +33,23 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["customer", "admin"],
+      enum: ["customer", "admin", "installer"],
       default: "customer",
+    },
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
+    installerProfile: {
+      availability: {
+        type: String,
+        enum: ["available", "unavailable"],
+        default: "available",
+      },
+      invitationToken: { type: String, default: "" },
+      invitationExpiresAt: { type: Date, default: null },
+      invitedAt: { type: Date, default: null },
+      activatedAt: { type: Date, default: null },
     },
   },
   { timestamps: true }

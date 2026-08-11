@@ -6,6 +6,7 @@ import axios from "axios";
 import mongoose from "mongoose";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
 import { jsPDF } from "jspdf";
@@ -64,14 +65,76 @@ const upload = multer({
   storage: multer.memoryStorage(),
 });
 
-mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => console.log("MongoDB connected"))
-  .catch((error) => console.error("MongoDB connection error:", error.message));
-
 const createToken = (payload) => {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "7d" });
 };
+
+const frontendUrl = () => process.env.FRONTEND_URL || "https://www.builtrightltd.com";
+
+const inspectionPaymentDetails = {
+  bank: process.env.INSPECTION_PAYMENT_BANK || "FCMB",
+  accountNumber: process.env.INSPECTION_PAYMENT_ACCOUNT || "2008839924",
+  accountName: process.env.INSPECTION_PAYMENT_ACCOUNT_NAME || "BuiltRight Services Ltd",
+};
+
+const initialInstallers = [
+  { fullName: "Mr Taiwo Olanrewaju", email: "taiwo.olanrewaju@builtrightltd.com" },
+  { fullName: "Ms Anita Agary", email: "anita.agary@builtrightltd.com" },
+];
+
+const safeHtml = (value = "") => String(value)
+  .replace(/&/g, "&amp;")
+  .replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;")
+  .replace(/'/g, "&#039;");
+
+const formatNaira = (amount) => `₦${Number(amount || 0).toLocaleString("en-NG", { maximumFractionDigits: 0 })}`;
+
+const makeInstallerInvite = async (installer) => {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const temporaryPassword = crypto.randomBytes(24).toString("base64url");
+  const user = await User.create({
+    fullName: installer.fullName,
+    email: installer.email,
+    phone: "",
+    password: await bcrypt.hash(temporaryPassword, 10),
+    role: "installer",
+    isActive: false,
+    installerProfile: {
+      availability: "available",
+      invitationToken: rawToken,
+      invitationExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      invitedAt: new Date(),
+    },
+  });
+  const activationUrl = `${frontendUrl()}/installer/activate?token=${rawToken}`;
+  try {
+    await sendEmail({
+      to: user.email,
+      subject: "Welcome to BuiltRight Installer Operations",
+      html: `<h2>Welcome to BuiltRight</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your installer account is ready. Set a secure password to access your assignments, schedule inspections, complete load audits, and submit installation-material requirements.</p><p><a href="${activationUrl}">Activate your installer account</a></p><p>This secure invitation expires in 7 days.</p>`,
+    });
+  } catch (mailError) {
+    console.error("INSTALLER INVITE EMAIL ERROR:", mailError.message);
+  }
+  return user;
+};
+
+const provisionInitialInstallers = async () => {
+  for (const installer of initialInstallers) {
+    const existing = await User.findOne({ email: installer.email });
+    if (!existing) await makeInstallerInvite(installer);
+  }
+};
+
+mongoose
+  .connect(process.env.MONGODB_URI)
+  .then(async () => {
+    console.log("MongoDB connected");
+    await provisionInitialInstallers();
+  })
+  .catch((error) => console.error("MongoDB connection error:", error.message));
 
 const requireAdminAuth = (req, res, next) => {
   try {
@@ -118,6 +181,10 @@ const requireCustomerAuth = (req, res, next) => {
     const token = authHeader.split(" ")[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
+    if (decoded.role !== "customer") {
+      return res.status(403).json({ status: false, message: "Customer access required." });
+    }
+
     req.user = decoded;
     next();
   } catch (error) {
@@ -125,6 +192,23 @@ const requireCustomerAuth = (req, res, next) => {
       status: false,
       message: "Invalid or expired token.",
     });
+  }
+};
+
+const requireInstallerAuth = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ status: false, message: "Unauthorized" });
+    }
+    const decoded = jwt.verify(authHeader.split(" ")[1], process.env.JWT_SECRET);
+    if (decoded.role !== "installer") {
+      return res.status(403).json({ status: false, message: "Installer access required." });
+    }
+    req.installer = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ status: false, message: "Invalid or expired token." });
   }
 };
 
@@ -1000,6 +1084,16 @@ app.post("/api/auth/register", async (req, res) => {
       role: user.role,
     });
 
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: "Welcome to BuiltRight Services",
+        html: `<h2>Welcome to BuiltRight Services Ltd</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your account has been created successfully. You can now request solar financing, receive quotations, review invoices, and track your project from your customer profile.</p><p><a href="${frontendUrl()}/customer/dashboard">Open my BuiltRight profile</a></p>`,
+      });
+    } catch (mailError) {
+      console.error("CUSTOMER WELCOME EMAIL ERROR:", mailError.message);
+    }
+
     return res.status(201).json({
       status: true,
       message: "Account created successfully.",
@@ -1040,6 +1134,13 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({
         status: false,
         message: "Invalid email or password.",
+      });
+    }
+
+    if (user.role !== "customer") {
+      return res.status(403).json({
+        status: false,
+        message: "Use the installer portal to access an installer account.",
       });
     }
 
@@ -1351,6 +1452,72 @@ app.patch("/api/admin/orders/:id/status", requireAdminAuth, async (req, res) => 
    LOAN / FINANCING REQUESTS
 ========================= */
 
+const activeInstallerStatuses = ["assigned", "accepted", "scheduled"];
+
+const chooseInstaller = async (excludedIds = []) => {
+  const excluded = excludedIds.filter(Boolean).map((id) => String(id));
+  const installers = await User.find({
+    role: "installer",
+    isActive: true,
+    "installerProfile.availability": "available",
+    "installerProfile.activatedAt": { $ne: null },
+    ...(excluded.length ? { _id: { $nin: excluded } } : {}),
+  });
+  if (!installers.length) return null;
+  const workloads = await Promise.all(installers.map(async (installer) => ({
+    installer,
+    assignments: await LoanRequest.countDocuments({
+      "installerAssignment.installer": installer._id,
+      "installerAssignment.status": { $in: activeInstallerStatuses },
+    }),
+  })));
+  workloads.sort((left, right) => left.assignments - right.assignments || left.installer.createdAt - right.installer.createdAt);
+  return workloads[0].installer;
+};
+
+const sendInstallerAssignmentEmail = async (loanRequest, installer, reassigned = false) => {
+  const profileUrl = `${frontendUrl()}/installer/assignments`;
+  await sendEmail({
+    to: installer.email,
+    subject: `${reassigned ? "Reassigned" : "New"} inspection assignment - ${loanRequest.reference}`,
+    html: `<h2>${reassigned ? "Inspection reassigned" : "New inspection assignment"}</h2><p>Hello ${safeHtml(installer.fullName)},</p><p>You have been assigned to ${safeHtml(loanRequest.customer.fullName)}'s solar-financing project.</p><ul><li><strong>Reference:</strong> ${safeHtml(loanRequest.reference)}</li><li><strong>Customer phone:</strong> ${safeHtml(loanRequest.customer.phone)}</li><li><strong>Project location:</strong> ${safeHtml(loanRequest.customer.location || "To be confirmed")}</li></ul><p>Please sign in, accept or decline the assignment, and arrange a convenient inspection time with the customer.</p><p><a href="${profileUrl}">Open installer profile</a></p>`,
+  });
+};
+
+const assignInstallerToLoanRequest = async (loanRequest, { excludedIds = [], reassigned = false, note = "" } = {}) => {
+  const installer = await chooseInstaller(excludedIds);
+  if (!installer) return null;
+  const previousHistory = loanRequest.installerAssignment?.history || [];
+  loanRequest.installerAssignment = {
+    installer: installer._id,
+    installerName: installer.fullName,
+    installerEmail: installer.email,
+    status: "assigned",
+    assignedAt: new Date(),
+    acceptedAt: null,
+    declinedAt: null,
+    declineReason: "",
+    reassignmentCount: Number(loanRequest.installerAssignment?.reassignmentCount || 0) + (reassigned ? 1 : 0),
+    history: [...previousHistory, { installer: installer._id, installerName: installer.fullName, status: "assigned", note: note || (reassigned ? "Automatically reassigned after decline." : "Automatically assigned when financing request was submitted."), changedAt: new Date() }],
+  };
+  loanRequest.status = "internal-review";
+  loanRequest.statusHistory.push({
+    status: "internal-review",
+    source: "system",
+    note: `Inspection assigned to ${installer.fullName}.`,
+  });
+  return installer;
+};
+
+const sendSubmissionConfirmationEmail = async (loanRequest) => {
+  const installerName = loanRequest.installerAssignment?.installerName || "a BuiltRight installer";
+  await sendEmail({
+    to: loanRequest.customer.email,
+    subject: `BuiltRight financing request received - ${loanRequest.reference}`,
+    html: `<h2>Your financing request was submitted successfully</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>We have received your request ${safeHtml(loanRequest.reference)}. ${safeHtml(installerName)} will contact you shortly to arrange a convenient time for your site inspection.</p><p>After the inspection, load audit, and due diligence, BuiltRight will prepare your final project quotation for approval.</p>`,
+  });
+};
+
 app.post("/api/loan-request", async (req, res) => {
   try {
     const {
@@ -1373,6 +1540,7 @@ app.post("/api/loan-request", async (req, res) => {
     const selectedProductSource = productSource || "BuiltRight Marketplace";
     const selectedFinanceInstitution =
       financeInstitution || "Bank partner pending";
+    const equityPercentage = selectedFinanceInstitution === "LOTUS Bank" ? 10 : 20;
 
     if (!customer?.fullName || !customer?.email || !customer?.phone) {
       return res.status(400).json({
@@ -1450,6 +1618,8 @@ app.post("/api/loan-request", async (req, res) => {
       consentToShare: Boolean(consentToShare),
       thirdPartyNoticeAccepted: Boolean(thirdPartyNoticeAccepted),
       preferredContact: "WhatsApp",
+      bankApplication: { provider: selectedFinanceInstitution, status: "not-started" },
+      deposit: { percentage: equityPercentage, status: "not-due" },
       assessment: {
         status: "open",
         triggeredAt: new Date(),
@@ -1476,6 +1646,23 @@ app.post("/api/loan-request", async (req, res) => {
       notes: notes || "",
     });
 
+    const assignedInstaller = await assignInstallerToLoanRequest(loanRequest);
+    await loanRequest.save();
+
+    try {
+      await sendSubmissionConfirmationEmail(loanRequest);
+    } catch (mailError) {
+      console.error("CUSTOMER FINANCING SUBMISSION EMAIL ERROR:", mailError.message);
+    }
+
+    if (assignedInstaller) {
+      try {
+        await sendInstallerAssignmentEmail(loanRequest, assignedInstaller);
+      } catch (mailError) {
+        console.error("INSTALLER ASSIGNMENT EMAIL ERROR:", mailError.message);
+      }
+    }
+
     try {
       await sendEmail({
         to: process.env.ADMIN_ALERT_EMAIL || process.env.SMTP_USER,
@@ -1487,15 +1674,13 @@ app.post("/api/loan-request", async (req, res) => {
           <p><strong>Phone:</strong> ${customer.phone}</p>
           <p><strong>Product Source:</strong> ${selectedProductSource}</p>
           <p><strong>Finance Institution:</strong> ${selectedFinanceInstitution}</p>
-          <p><strong>Status:</strong> submitted</p>
+          <p><strong>Assigned installer:</strong> ${safeHtml(loanRequest.installerAssignment?.installerName || "No active installer available")}</p>
+          <p><strong>Status:</strong> ${safeHtml(loanRequest.status)}</p>
         `,
       });
     } catch (mailError) {
       console.error("ADMIN FINANCING EMAIL ERROR:", mailError.message);
     }
-
-    // Email disabled during local testing.
-    // Re-enable after SMTP is confirmed working.
 
     return res.json({
       status: true,
@@ -1560,6 +1745,7 @@ app.get("/api/loan-requests/:id/workspace", requireAdminAuth, async (req, res) =
     if (!loanRequest) {
       return res.status(404).json({ status: false, message: "Financing case not found." });
     }
+
     const documents = await ProjectDocument.find({ financingRequest: loanRequest._id })
       .sort({ createdAt: -1 })
       .lean();
@@ -1567,6 +1753,200 @@ app.get("/api/loan-requests/:id/workspace", requireAdminAuth, async (req, res) =
   } catch (error) {
     console.error("LOAD FINANCING WORKSPACE ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not load the financing workspace." });
+  }
+});
+
+/* =========================
+   INSTALLER AUTH
+========================= */
+
+app.post("/api/installer/activate", async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password || password.length < 8) {
+      return res.status(400).json({ status: false, message: "A valid invitation token and an 8-character password are required." });
+    }
+    const installer = await User.findOne({
+      role: "installer",
+      "installerProfile.invitationToken": token,
+      "installerProfile.invitationExpiresAt": { $gt: new Date() },
+    });
+    if (!installer) {
+      return res.status(400).json({ status: false, message: "This installer invitation is invalid or has expired." });
+    }
+    installer.password = await bcrypt.hash(password, 10);
+    installer.isActive = true;
+    installer.installerProfile.invitationToken = "";
+    installer.installerProfile.invitationExpiresAt = null;
+    installer.installerProfile.activatedAt = new Date();
+    await installer.save();
+    return res.json({ status: true, message: "Installer account activated. You can now sign in." });
+  } catch (error) {
+    console.error("INSTALLER ACTIVATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Installer account could not be activated." });
+  }
+});
+
+app.post("/api/installer/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const installer = await User.findOne({ email: String(email || "").toLowerCase(), role: "installer" });
+    if (!installer || !installer.isActive || !(await bcrypt.compare(password || "", installer.password))) {
+      return res.status(401).json({ status: false, message: "Invalid installer credentials." });
+    }
+    const token = createToken({ id: installer._id, email: installer.email, role: "installer" });
+    return res.json({
+      status: true,
+      token,
+      user: { id: installer._id, fullName: installer.fullName, email: installer.email, role: installer.role },
+    });
+  } catch (error) {
+    console.error("INSTALLER LOGIN ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Installer login failed." });
+  }
+});
+
+app.get("/api/installer/assignments", requireInstallerAuth, async (req, res) => {
+  try {
+    const assignments = await LoanRequest.find({ "installerAssignment.installer": req.installer.id })
+      .sort({ "installerAssignment.assignedAt": -1 })
+      .lean();
+    return res.json({ status: true, assignments });
+  } catch (error) {
+    console.error("INSTALLER ASSIGNMENTS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load installer assignments." });
+  }
+});
+
+app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (req, res) => {
+  try {
+    const { scheduledAt, location, inspectionFeeAmount } = req.body;
+    if (!scheduledAt || !location || Number(inspectionFeeAmount) <= 0) {
+      return res.status(400).json({ status: false, message: "Inspection date, time, location, and a fee amount are required." });
+    }
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    if (!loanRequest || loanRequest.installerAssignment?.status !== "assigned") {
+      return res.status(404).json({ status: false, message: "This assignment is no longer available for acceptance." });
+    }
+    const scheduledDate = new Date(scheduledAt);
+    if (Number.isNaN(scheduledDate.getTime()) || scheduledDate <= new Date()) {
+      return res.status(400).json({ status: false, message: "Choose a future inspection date and time." });
+    }
+    loanRequest.installerAssignment.status = "scheduled";
+    loanRequest.installerAssignment.acceptedAt = new Date();
+    loanRequest.installerAssignment.history.push({ installer: req.installer.id, installerName: loanRequest.installerAssignment.installerName, status: "accepted", note: "Installer accepted and scheduled the inspection.", changedAt: new Date() });
+    loanRequest.inspection.status = "scheduled";
+    loanRequest.inspection.scheduledAt = scheduledDate;
+    loanRequest.inspection.assignee = loanRequest.installerAssignment.installerName;
+    loanRequest.inspection.notes = `Inspection location: ${location}`;
+    loanRequest.inspection.feeAmount = Number(inspectionFeeAmount);
+    loanRequest.inspection.feeStatus = "payment-requested";
+    loanRequest.assessment.inspection.status = "scheduled";
+    loanRequest.assessment.status = "in-progress";
+    loanRequest.status = "inspection-scheduled";
+    loanRequest.statusHistory.push({ status: "inspection-scheduled", source: "installer", note: `Inspection scheduled by ${loanRequest.installerAssignment.installerName}.` });
+    await loanRequest.save();
+    try {
+      await sendEmail({
+        to: loanRequest.customer.email,
+        subject: `BuiltRight inspection scheduled - ${loanRequest.reference}`,
+        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(location)}</li><li><strong>Inspection fee:</strong> ${formatNaira(inspectionFeeAmount)}</li></ul><p>Please make the inspection-fee payment using the details below and keep your proof of payment available for the visit.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul>`,
+      });
+    } catch (mailError) {
+      console.error("INSPECTION SCHEDULE EMAIL ERROR:", mailError.message);
+    }
+    return res.json({ status: true, message: "Inspection accepted, scheduled, and emailed to the customer.", loanRequest });
+  } catch (error) {
+    console.error("ACCEPT INSTALLER ASSIGNMENT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not accept the inspection assignment." });
+  }
+});
+
+app.patch("/api/installer/assignments/:id/decline", requireInstallerAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    if (!loanRequest || loanRequest.installerAssignment?.status !== "assigned") {
+      return res.status(404).json({ status: false, message: "This assignment is no longer available for decline." });
+    }
+    const previousInstaller = loanRequest.installerAssignment;
+    loanRequest.installerAssignment.history.push({ installer: previousInstaller.installer, installerName: previousInstaller.installerName, status: "declined", note: String(req.body.reason || "Installer declined the assignment."), changedAt: new Date() });
+    const replacement = await assignInstallerToLoanRequest(loanRequest, {
+      excludedIds: [previousInstaller.installer],
+      reassigned: true,
+      note: `Automatically reassigned after ${previousInstaller.installerName} declined.`,
+    });
+    if (!replacement) {
+      loanRequest.installerAssignment.status = "declined";
+      loanRequest.installerAssignment.declinedAt = new Date();
+      loanRequest.installerAssignment.declineReason = String(req.body.reason || "Installer declined the assignment.");
+      loanRequest.statusHistory.push({ status: loanRequest.status, source: "system", note: "No alternate active installer is available; admin reassignment is required." });
+    }
+    await loanRequest.save();
+    if (replacement) {
+      try { await sendInstallerAssignmentEmail(loanRequest, replacement, true); } catch (mailError) { console.error("REASSIGNMENT EMAIL ERROR:", mailError.message); }
+      try {
+        await sendEmail({
+          to: loanRequest.customer.email,
+          subject: `BuiltRight installer update - ${loanRequest.reference}`,
+          html: `<p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>Your inspection has been reassigned to ${safeHtml(replacement.fullName)}. They will contact you shortly to arrange a convenient visit time.</p>`,
+        });
+      } catch (mailError) { console.error("CUSTOMER REASSIGNMENT EMAIL ERROR:", mailError.message); }
+    }
+    return res.json({ status: true, message: replacement ? `Assignment reassigned to ${replacement.fullName}.` : "No alternate installer is currently active. An administrator must reassign this request.", loanRequest });
+  } catch (error) {
+    console.error("DECLINE INSTALLER ASSIGNMENT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not decline the inspection assignment." });
+  }
+});
+
+app.patch("/api/installer/assignments/:id/report", requireInstallerAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    if (!loanRequest || !["accepted", "scheduled"].includes(loanRequest.installerAssignment?.status)) {
+      return res.status(404).json({ status: false, message: "Only an accepted inspection assignment can be updated." });
+    }
+    const { inspection = {}, loadAudit = {}, dueDiligence = {}, inspectionCosts = [] } = req.body;
+    const copyFields = (target, source, fields) => fields.forEach((field) => {
+      if (Object.prototype.hasOwnProperty.call(source, field)) target[field] = source[field];
+    });
+    copyFields(loanRequest.assessment.inspection, inspection, ["status", "result", "notes"]);
+    copyFields(loanRequest.assessment.loadAudit, loadAudit, ["status", "result", "peakLoadKw", "dailyEnergyKwh", "criticalLoadKw", "recommendedInverterKva", "recommendedBatteryKwh", "recommendedSolarKw", "backupHours", "appliances", "notes"]);
+    copyFields(loanRequest.assessment.dueDiligence, dueDiligence, ["status", "result", "checklist", "notes"]);
+    loanRequest.assessment.inspection.completedBy = loanRequest.installerAssignment.installerName;
+    loanRequest.assessment.loadAudit.completedBy = loanRequest.installerAssignment.installerName;
+    loanRequest.assessment.dueDiligence.completedBy = loanRequest.installerAssignment.installerName;
+    if (Array.isArray(inspectionCosts)) {
+      loanRequest.inspectionCosts = inspectionCosts
+        .filter((item) => item?.label)
+        .map((item) => ({ label: String(item.label), amount: Number(item.amount || 0) }));
+    }
+    if (loanRequest.assessment.inspection.status === "completed") {
+      loanRequest.assessment.inspection.completedAt ||= new Date();
+      loanRequest.inspection.status = "completed";
+      loanRequest.inspection.completedAt ||= new Date();
+      loanRequest.installerAssignment.status = "completed";
+    }
+    if (loanRequest.assessment.loadAudit.status === "completed") loanRequest.assessment.loadAudit.completedAt ||= new Date();
+    if (loanRequest.assessment.dueDiligence.status === "completed") loanRequest.assessment.dueDiligence.completedAt ||= new Date();
+    const inspectionPassed = loanRequest.assessment.inspection.status === "completed" && loanRequest.assessment.inspection.result === "pass";
+    const auditPassed = loanRequest.assessment.loadAudit.status === "completed" && loanRequest.assessment.loadAudit.result === "pass" && [loanRequest.assessment.loadAudit.peakLoadKw, loanRequest.assessment.loadAudit.dailyEnergyKwh, loanRequest.assessment.loadAudit.recommendedInverterKva, loanRequest.assessment.loadAudit.recommendedBatteryKwh, loanRequest.assessment.loadAudit.recommendedSolarKw].every((value) => Number(value) > 0);
+    const dueDiligencePassed = loanRequest.assessment.dueDiligence.status === "completed" && loanRequest.assessment.dueDiligence.result === "pass" && (loanRequest.assessment.dueDiligence.checklist || []).length > 0 && (loanRequest.assessment.dueDiligence.checklist || []).every((item) => ["pass", "not-applicable"].includes(item.status));
+    if ([loanRequest.assessment.inspection.result, loanRequest.assessment.loadAudit.result, loanRequest.assessment.dueDiligence.result].includes("fail")) {
+      loanRequest.assessment.status = "failed";
+      loanRequest.status = "due-diligence-failed";
+    } else if (inspectionPassed && auditPassed && dueDiligencePassed) {
+      loanRequest.assessment.status = "passed";
+      loanRequest.status = "due-diligence-passed";
+    } else {
+      loanRequest.assessment.status = "in-progress";
+      loanRequest.status = auditPassed ? "load-audit-completed" : inspectionPassed ? "inspection-completed" : "inspection-scheduled";
+    }
+    loanRequest.statusHistory.push({ status: loanRequest.status, source: "installer", note: `Inspection, load-audit, due-diligence, and material report updated by ${loanRequest.installerAssignment.installerName}.` });
+    await loanRequest.save();
+    return res.json({ status: true, message: loanRequest.assessment.status === "passed" ? "Assessment passed and material costs submitted. The quotation is ready for BuiltRight operations." : "Installer report saved.", loanRequest });
+  } catch (error) {
+    console.error("INSTALLER REPORT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not save the installer report." });
   }
 });
 
@@ -2611,6 +2991,37 @@ app.delete("/api/admin/customers/:id", requireAdminAuth, async (req, res) => {
       status: false,
       message: "Failed to delete customer.",
     });
+  }
+});
+
+app.get("/api/admin/installers", requireAdminAuth, async (req, res) => {
+  try {
+    const installers = await User.find({ role: "installer" }).select("-password -installerProfile.invitationToken").sort({ createdAt: 1 }).lean();
+    const installersWithWorkload = await Promise.all(installers.map(async (installer) => ({
+      ...installer,
+      activeAssignments: await LoanRequest.countDocuments({
+        "installerAssignment.installer": installer._id,
+        "installerAssignment.status": { $in: activeInstallerStatuses },
+      }),
+    })));
+    return res.json({ status: true, installers: installersWithWorkload });
+  } catch (error) {
+    console.error("GET INSTALLERS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load installers." });
+  }
+});
+
+app.post("/api/admin/installers", requireAdminAuth, async (req, res) => {
+  try {
+    const { fullName, email } = req.body;
+    if (!fullName || !email) return res.status(400).json({ status: false, message: "Installer name and email are required." });
+    const existing = await User.findOne({ email: String(email).toLowerCase() });
+    if (existing) return res.status(409).json({ status: false, message: "An account already uses this email address." });
+    const installer = await makeInstallerInvite({ fullName: String(fullName).trim(), email: String(email).toLowerCase().trim() });
+    return res.status(201).json({ status: true, message: "Installer invitation email sent.", installer: { id: installer._id, fullName: installer.fullName, email: installer.email } });
+  } catch (error) {
+    console.error("CREATE INSTALLER ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not create installer." });
   }
 });
 

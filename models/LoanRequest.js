@@ -177,6 +177,36 @@ const loanRequestSchema = new mongoose.Schema(
       cableDistance: { type: String, default: "" },
       mountingMethod: { type: String, default: "" },
       notes: { type: String, default: "" },
+      feeAmount: { type: Number, default: null },
+      feeStatus: { type: String, default: "not-requested" },
+    },
+
+    installerAssignment: {
+      installer: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+      installerName: { type: String, default: "", trim: true },
+      installerEmail: { type: String, default: "", trim: true, lowercase: true },
+      status: {
+        type: String,
+        enum: ["unassigned", "assigned", "accepted", "scheduled", "declined", "completed"],
+        default: "unassigned",
+      },
+      assignedAt: { type: Date, default: null },
+      acceptedAt: { type: Date, default: null },
+      declinedAt: { type: Date, default: null },
+      declineReason: { type: String, default: "", trim: true },
+      reassignmentCount: { type: Number, default: 0 },
+      history: {
+        type: [
+          {
+            installer: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+            installerName: { type: String, default: "" },
+            status: { type: String, default: "assigned" },
+            note: { type: String, default: "" },
+            changedAt: { type: Date, default: Date.now },
+          },
+        ],
+        default: [],
+      },
     },
 
     assessment: {
