@@ -2,6 +2,12 @@ import mongoose from "mongoose";
 
 const loanRequestSchema = new mongoose.Schema(
   {
+    reference: {
+      type: String,
+      default: () => `BRF-${Date.now().toString().slice(-8)}`,
+      index: true,
+    },
+
     customer: {
       fullName: {
         type: String,
@@ -19,6 +25,11 @@ const loanRequestSchema = new mongoose.Schema(
         required: true,
         trim: true,
       },
+      location: {
+        type: String,
+        default: "",
+        trim: true,
+      },
     },
 
     productSource: {
@@ -29,12 +40,8 @@ const loanRequestSchema = new mongoose.Schema(
 
     financeInstitution: {
       type: String,
-      enum: [
-        "Rich Green Microfinance Bank",
-        "Premium Trust Bank",
-        "Zenith Bank",
-      ],
-      default: "Rich Green Microfinance Bank",
+      default: "Bank partner pending",
+      trim: true,
     },
 
     interestRate: {
@@ -135,6 +142,173 @@ const loanRequestSchema = new mongoose.Schema(
       default: null,
     },
 
+    finalProjectCost: {
+      type: Number,
+      default: null,
+    },
+
+    upfrontCosts: {
+      type: [
+        {
+          label: { type: String, default: "" },
+          amount: { type: Number, default: null },
+          confirmed: { type: Boolean, default: false },
+        },
+      ],
+      default: [],
+    },
+
+    inspectionCosts: {
+      type: [
+        {
+          label: { type: String, default: "" },
+          amount: { type: Number, default: null },
+        },
+      ],
+      default: [],
+    },
+
+    inspection: {
+      status: { type: String, default: "not-scheduled" },
+      scheduledAt: { type: Date, default: null },
+      completedAt: { type: Date, default: null },
+      assignee: { type: String, default: "" },
+      propertyType: { type: String, default: "" },
+      cableDistance: { type: String, default: "" },
+      mountingMethod: { type: String, default: "" },
+      notes: { type: String, default: "" },
+    },
+
+    assessment: {
+      status: {
+        type: String,
+        enum: ["open", "in-progress", "passed", "failed"],
+        default: "open",
+      },
+      triggeredAt: { type: Date, default: Date.now },
+      inspection: {
+        status: {
+          type: String,
+          enum: ["pending", "scheduled", "completed", "failed"],
+          default: "pending",
+        },
+        result: {
+          type: String,
+          enum: ["pending", "pass", "fail"],
+          default: "pending",
+        },
+        completedAt: { type: Date, default: null },
+        completedBy: { type: String, default: "", trim: true },
+        notes: { type: String, default: "", trim: true },
+      },
+      loadAudit: {
+        status: {
+          type: String,
+          enum: ["pending", "in-progress", "completed", "failed"],
+          default: "pending",
+        },
+        result: {
+          type: String,
+          enum: ["pending", "pass", "fail"],
+          default: "pending",
+        },
+        peakLoadKw: { type: Number, default: null },
+        dailyEnergyKwh: { type: Number, default: null },
+        criticalLoadKw: { type: Number, default: null },
+        recommendedInverterKva: { type: Number, default: null },
+        recommendedBatteryKwh: { type: Number, default: null },
+        recommendedSolarKw: { type: Number, default: null },
+        backupHours: { type: Number, default: null },
+        appliances: {
+          type: [
+            {
+              name: { type: String, default: "", trim: true },
+              quantity: { type: Number, default: 1 },
+              watts: { type: Number, default: 0 },
+              hoursPerDay: { type: Number, default: 0 },
+              critical: { type: Boolean, default: false },
+            },
+          ],
+          default: [],
+        },
+        completedAt: { type: Date, default: null },
+        completedBy: { type: String, default: "", trim: true },
+        notes: { type: String, default: "", trim: true },
+      },
+      dueDiligence: {
+        status: {
+          type: String,
+          enum: ["pending", "in-progress", "completed", "failed"],
+          default: "pending",
+        },
+        result: {
+          type: String,
+          enum: ["pending", "pass", "fail"],
+          default: "pending",
+        },
+        checklist: {
+          type: [
+            {
+              key: { type: String, required: true, trim: true },
+              label: { type: String, required: true, trim: true },
+              status: {
+                type: String,
+                enum: ["pending", "pass", "fail", "not-applicable"],
+                default: "pending",
+              },
+              note: { type: String, default: "", trim: true },
+            },
+          ],
+          default: [],
+        },
+        completedAt: { type: Date, default: null },
+        completedBy: { type: String, default: "", trim: true },
+        notes: { type: String, default: "", trim: true },
+      },
+    },
+
+    quotation: {
+      status: {
+        type: String,
+        enum: ["not-started", "draft", "sent", "approved", "changes-requested", "expired", "void"],
+        default: "not-started",
+      },
+      document: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "ProjectDocument",
+        default: null,
+      },
+      reference: { type: String, default: "", trim: true },
+      version: { type: Number, default: 0 },
+      sentAt: { type: Date, default: null },
+      approvedAt: { type: Date, default: null },
+      changesRequestedAt: { type: Date, default: null },
+    },
+
+    bankApplication: {
+      provider: { type: String, default: "" },
+      externalReference: { type: String, default: "" },
+      status: { type: String, default: "not-started" },
+      redirectUrl: { type: String, default: "" },
+      approvedAmount: { type: Number, default: null },
+      disbursedAmount: { type: Number, default: null },
+      disbursedAt: { type: Date, default: null },
+      quotationDocument: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "ProjectDocument",
+        default: null,
+      },
+      quotationSharedAt: { type: Date, default: null },
+      customerApprovedAt: { type: Date, default: null },
+    },
+
+    deposit: {
+      percentage: { type: Number, default: 20 },
+      amount: { type: Number, default: null },
+      status: { type: String, default: "not-due" },
+      paidAt: { type: Date, default: null },
+    },
+
     preferredContact: {
       type: String,
       default: "WhatsApp",
@@ -153,6 +327,26 @@ const loanRequestSchema = new mongoose.Schema(
     status: {
   type: String,
   enum: [
+    "submitted",
+    "internal-review",
+    "inspection-scheduled",
+    "inspection-completed",
+    "load-audit-completed",
+    "due-diligence-passed",
+    "due-diligence-failed",
+    "quotation-draft",
+    "quotation-sent",
+    "quotation-approved",
+    "quotation-prepared",
+    "kyc-submitted",
+    "credit-review",
+    "rejected",
+    "awaiting-deposit",
+    "deposit-paid",
+    "awaiting-disbursement",
+    "disbursed",
+    "order-created",
+    "installation-in-progress",
     "pending",
     "contacted",
     "sent-to-bank",
@@ -162,8 +356,20 @@ const loanRequestSchema = new mongoose.Schema(
     "installation-scheduled",
     "completed",
   ],
-  default: "pending",
+  default: "submitted",
 },
+
+    statusHistory: {
+      type: [
+        {
+          status: { type: String, required: true },
+          source: { type: String, default: "admin" },
+          note: { type: String, default: "" },
+          changedAt: { type: Date, default: Date.now },
+        },
+      ],
+      default: [],
+    },
 
     notes: {
       type: String,

@@ -8,11 +8,16 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
+import { jsPDF } from "jspdf";
 
 import Product from "./models/Product.js";
 import Order from "./models/Order.js";
 import LoanRequest from "./models/LoanRequest.js";
 import User from "./models/User.js";
+import Device from "./models/Device.js";
+import DeviceAlert from "./models/DeviceAlert.js";
+import DeviceCommand from "./models/DeviceCommand.js";
+import ProjectDocument from "./models/ProjectDocument.js";
 import sendEmail from "./utils/sendEmail.js";
 
 dotenv.config();
@@ -21,6 +26,32 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
+
+// Provider webhook routes keep the raw request body available for future
+// HMAC verification. They remain closed until each provider specification and
+// secret has been configured.
+app.post(
+  "/api/webhooks/bank/:provider",
+  express.raw({ type: "application/json" }),
+  (req, res) =>
+    res.status(503).json({
+      status: false,
+      code: "BANK_PROVIDER_NOT_CONFIGURED",
+      message: "Bank webhook processing is not configured.",
+    })
+);
+
+app.post(
+  "/api/webhooks/ashgridx",
+  express.raw({ type: "application/json" }),
+  (req, res) =>
+    res.status(503).json({
+      status: false,
+      code: "ASHGRIDX_NOT_CONFIGURED",
+      message: "AshGridX webhook processing is not configured.",
+    })
+);
+
 app.use(express.json());
 
 cloudinary.config({
@@ -97,6 +128,431 @@ const requireCustomerAuth = (req, res, next) => {
   }
 };
 
+const generateOperationsReference = (prefix) =>
+  `${prefix}-${Date.now().toString(36).toUpperCase()}-${new mongoose.Types.ObjectId()
+    .toString()
+    .slice(-4)
+    .toUpperCase()}`;
+
+const escapeSearchText = (value = "") =>
+  String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const bankProviderConfigured =
+  process.env.BANK_PROVIDER_ENABLED === "true" &&
+  Boolean(process.env.BANK_PROVIDER_NAME && process.env.BANK_PROVIDER_BASE_URL);
+
+// Credentials can be stored now, but outbound AshGridX commands remain closed
+// until the final tamper, acknowledgement, and signature rules are confirmed.
+const ashGridCredentialsPresent = Boolean(
+  process.env.ASHGRIDX_API_BASE_URL && process.env.ASHGRIDX_API_KEY
+);
+const ashGridAdapterReady = false;
+
+app.get("/api/integrations/status", requireAdminAuth, (req, res) => {
+  res.json({
+    status: true,
+    integrations: {
+      bank: {
+        configured: bankProviderConfigured,
+        mode: bankProviderConfigured ? "sandbox" : "manual",
+      },
+      ashGridX: {
+        configured: ashGridAdapterReady,
+        credentialsPresent: ashGridCredentialsPresent,
+        mode: "sandbox-placeholder",
+      },
+    },
+  });
+});
+
+app.post(
+  "/api/integrations/bank/applications",
+  requireAdminAuth,
+  (req, res) =>
+    res.status(503).json({
+      status: false,
+      code: "BANK_PROVIDER_NOT_CONFIGURED",
+      message:
+        "The financing case can continue through manual bank handoff, but the provider API is not configured.",
+    })
+);
+
+app.post(
+  "/api/integrations/ashgridx/device/control",
+  requireAdminAuth,
+  handleDeviceControl
+);
+
+async function resolveDevice(identifier) {
+  if (!identifier) return null;
+  if (mongoose.isValidObjectId(identifier)) {
+    const byId = await Device.findById(identifier);
+    if (byId) return byId;
+  }
+  return Device.findOne({
+    $or: [
+      { reference: String(identifier).toUpperCase() },
+      { providerDeviceId: String(identifier) },
+    ],
+  });
+}
+
+async function handleDeviceControl(req, res) {
+  try {
+    const identifier =
+      req.params.id || req.body.deviceId || req.body.customerDeviceId;
+    const action = req.body.action || req.body.control;
+    const reason = String(req.body.reason || "").trim();
+    const device = await resolveDevice(identifier);
+
+    if (!device) {
+      return res.status(404).json({ status: false, message: "Device not found." });
+    }
+
+    if (!["on", "off"].includes(action)) {
+      return res.status(400).json({
+        status: false,
+        message: "Device action must be either on or off.",
+      });
+    }
+
+    if (!reason) {
+      return res.status(400).json({
+        status: false,
+        message: "A control reason is required for the audit trail.",
+      });
+    }
+
+    const humanConfirmed = req.body.confirmation === device.reference;
+    const policyFailures = [];
+    const now = new Date();
+
+    if (!humanConfirmed) {
+      policyFailures.push(`Type ${device.reference} to confirm this device action.`);
+    }
+
+    if (device.connectivity !== "online") {
+      policyFailures.push("Device connectivity must be online and verified.");
+    }
+
+    if (action === "off") {
+      if (device.paymentStanding !== "default-eligible") {
+        policyFailures.push("Customer default has not been marked eligible for disablement.");
+      }
+      if (!device.defaultVerifiedAt) {
+        policyFailures.push("Customer default has not been independently verified.");
+      }
+      if (!device.gracePeriod?.endsAt || device.gracePeriod.endsAt > now) {
+        policyFailures.push("The required 10-day grace period has not completed.");
+      }
+      if (!device.gracePeriod?.communicationsCompletedAt) {
+        policyFailures.push("Required customer communications have not been completed.");
+      }
+    }
+
+    if (action === "on" && !["current", "cleared"].includes(device.paymentStanding)) {
+      policyFailures.push("Payment clearance must be recorded before activation.");
+    }
+
+    const policySnapshot = {
+      paymentStanding: device.paymentStanding,
+      gracePeriodEndsAt: device.gracePeriod?.endsAt || null,
+      defaultVerifiedAt: device.defaultVerifiedAt,
+      communicationsCompletedAt:
+        device.gracePeriod?.communicationsCompletedAt || null,
+      deviceConnectivity: device.connectivity,
+      humanConfirmed,
+    };
+
+    if (policyFailures.length > 0) {
+      const command = await DeviceCommand.create({
+        reference: generateOperationsReference("BRCMD"),
+        device: device._id,
+        deviceReference: device.reference,
+        action,
+        status: "blocked",
+        requestedBy: {
+          id: req.admin?.id || "",
+          email: req.admin?.email || "",
+        },
+        reason,
+        policySnapshot,
+        blockedReason: policyFailures.join(" "),
+      });
+
+      return res.status(409).json({
+        status: false,
+        code: "DEVICE_CONTROL_POLICY_BLOCKED",
+        message: "Device action blocked by BuiltRight safety policy.",
+        reasons: policyFailures,
+        commandReference: command.reference,
+      });
+    }
+
+    const command = await DeviceCommand.create({
+      reference: generateOperationsReference("BRCMD"),
+      device: device._id,
+      deviceReference: device.reference,
+      action,
+      status: "blocked",
+      requestedBy: {
+        id: req.admin?.id || "",
+        email: req.admin?.email || "",
+      },
+      reason,
+      policySnapshot,
+      blockedReason: ashGridCredentialsPresent
+        ? "AshGridX adapter awaiting final acknowledgement and tamper rules."
+        : "AshGridX staging credentials are not configured.",
+    });
+
+    return res.status(503).json({
+      status: false,
+      code: "ASHGRIDX_NOT_CONFIGURED",
+      message:
+        "No device command was sent. The safe provider adapter remains inactive.",
+      commandReference: command.reference,
+    });
+  } catch (error) {
+    console.error("Device control error:", error);
+    return res.status(500).json({
+      status: false,
+      message: "Device control request could not be processed.",
+    });
+  }
+}
+
+app.get("/api/admin/devices", requireAdminAuth, async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.connectivity) query.connectivity = req.query.connectivity;
+    if (req.query.paymentStanding) query.paymentStanding = req.query.paymentStanding;
+    if (req.query.tamper === "true") query["tamper.status"] = { $ne: "clear" };
+
+    if (req.query.search) {
+      const search = new RegExp(escapeSearchText(req.query.search), "i");
+      query.$or = [
+        { reference: search },
+        { providerDeviceId: search },
+        { serialNumber: search },
+        { projectReference: search },
+        { "customerSnapshot.fullName": search },
+        { "site.address": search },
+      ];
+    }
+
+    const devices = await Device.find(query).sort({ updatedAt: -1 }).limit(250).lean();
+    return res.json({ status: true, devices });
+  } catch (error) {
+    console.error("Fetch devices error:", error);
+    return res.status(500).json({ status: false, message: "Could not load devices." });
+  }
+});
+
+app.post("/api/admin/devices", requireAdminAuth, async (req, res) => {
+  try {
+    const {
+      reference,
+      providerDeviceId,
+      serialNumber,
+      label,
+      customerId,
+      customerSnapshot,
+      financingRequestId,
+      orderId,
+      projectReference,
+      site,
+      installedAt,
+    } = req.body;
+
+    if (!reference) {
+      return res.status(400).json({
+        status: false,
+        message: "A unique BuiltRight device reference is required.",
+      });
+    }
+
+    let customer = null;
+    if (customerId) {
+      if (!mongoose.isValidObjectId(customerId)) {
+        return res.status(400).json({ status: false, message: "Invalid customer ID." });
+      }
+      customer = await User.findById(customerId);
+      if (!customer) {
+        return res.status(404).json({ status: false, message: "Customer not found." });
+      }
+    }
+
+    const device = await Device.create({
+      reference,
+      providerDeviceId: providerDeviceId || undefined,
+      serialNumber,
+      label,
+      customer: customer?._id || null,
+      customerSnapshot: customer
+        ? {
+            fullName: customer.fullName,
+            email: customer.email,
+            phone: customer.phone,
+          }
+        : customerSnapshot,
+      financingRequest: financingRequestId || null,
+      order: orderId || null,
+      projectReference,
+      site,
+      installedAt: installedAt || null,
+      assignmentStatus: customer || customerSnapshot?.fullName ? "assigned" : "unassigned",
+    });
+
+    return res.status(201).json({ status: true, device });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({
+        status: false,
+        message: "That BuiltRight or provider device ID is already registered.",
+      });
+    }
+    console.error("Create device error:", error);
+    return res.status(500).json({ status: false, message: "Could not register device." });
+  }
+});
+
+app.patch("/api/admin/devices/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const device = await resolveDevice(req.params.id);
+    if (!device) {
+      return res.status(404).json({ status: false, message: "Device not found." });
+    }
+
+    const allowedFields = [
+      "providerDeviceId",
+      "serialNumber",
+      "label",
+      "customerSnapshot",
+      "financingRequest",
+      "order",
+      "projectReference",
+      "site",
+      "assignmentStatus",
+      "connectivity",
+      "inverterState",
+      "lastSeenAt",
+      "tamper",
+      "paymentStanding",
+      "defaultVerifiedAt",
+      "gracePeriod",
+      "installedAt",
+      "metadata",
+    ];
+
+    allowedFields.forEach((field) => {
+      if (Object.prototype.hasOwnProperty.call(req.body, field)) {
+        device.set(field, req.body[field]);
+      }
+    });
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "customerId")) {
+      if (req.body.customerId && !mongoose.isValidObjectId(req.body.customerId)) {
+        return res.status(400).json({ status: false, message: "Invalid customer ID." });
+      }
+      const customer = req.body.customerId
+        ? await User.findById(req.body.customerId)
+        : null;
+      if (req.body.customerId && !customer) {
+        return res.status(404).json({ status: false, message: "Customer not found." });
+      }
+      device.customer = customer?._id || null;
+      if (customer) {
+        device.customerSnapshot = {
+          fullName: customer.fullName,
+          email: customer.email,
+          phone: customer.phone,
+        };
+      }
+    }
+
+    await device.save();
+    return res.json({ status: true, device });
+  } catch (error) {
+    console.error("Update device error:", error);
+    return res.status(500).json({ status: false, message: "Could not update device." });
+  }
+});
+
+app.post("/api/admin/devices/:id/control", requireAdminAuth, handleDeviceControl);
+
+app.get("/api/admin/device-alerts", requireAdminAuth, async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.status) query.status = req.query.status;
+    if (req.query.type) query.type = req.query.type;
+    if (req.query.deviceId) {
+      const device = await resolveDevice(req.query.deviceId);
+      if (!device) return res.json({ status: true, alerts: [] });
+      query.device = device._id;
+    }
+    const alerts = await DeviceAlert.find(query)
+      .sort({ occurredAt: -1 })
+      .limit(250)
+      .lean();
+    return res.json({ status: true, alerts });
+  } catch (error) {
+    console.error("Fetch device alerts error:", error);
+    return res.status(500).json({ status: false, message: "Could not load device alerts." });
+  }
+});
+
+app.patch("/api/admin/device-alerts/:id/status", requireAdminAuth, async (req, res) => {
+  try {
+    if (!["acknowledged", "resolved"].includes(req.body.status)) {
+      return res.status(400).json({
+        status: false,
+        message: "Alert status must be acknowledged or resolved.",
+      });
+    }
+
+    const alert = await DeviceAlert.findById(req.params.id);
+    if (!alert) {
+      return res.status(404).json({ status: false, message: "Alert not found." });
+    }
+
+    if (req.body.status === "acknowledged") {
+      alert.status = "acknowledged";
+      alert.acknowledgedAt = new Date();
+      alert.acknowledgedBy = req.admin?.email || "BuiltRight admin";
+    } else {
+      alert.status = "resolved";
+      alert.resolvedAt = new Date();
+      alert.resolvedBy = req.admin?.email || "BuiltRight admin";
+    }
+
+    await alert.save();
+    return res.json({ status: true, alert });
+  } catch (error) {
+    console.error("Update device alert error:", error);
+    return res.status(500).json({ status: false, message: "Could not update alert." });
+  }
+});
+
+app.get("/api/admin/device-commands", requireAdminAuth, async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.deviceId) {
+      const device = await resolveDevice(req.query.deviceId);
+      if (!device) return res.json({ status: true, commands: [] });
+      query.device = device._id;
+    }
+    const commands = await DeviceCommand.find(query)
+      .sort({ createdAt: -1 })
+      .limit(250)
+      .lean();
+    return res.json({ status: true, commands });
+  } catch (error) {
+    console.error("Fetch device commands error:", error);
+    return res.status(500).json({ status: false, message: "Could not load device commands." });
+  }
+});
+
 const generateOrderNumber = () => {
   const now = new Date();
   const datePart = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(
@@ -111,6 +567,172 @@ const generateOrderNumber = () => {
 const formatCurrency = (value) => {
   if (value == null) return "Request Price";
   return `₦${Number(value).toLocaleString()}`;
+};
+
+const escapeHtml = (value = "") =>
+  String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+
+const formatDocumentMoney = (value) =>
+  `NGN ${Number(value || 0).toLocaleString("en-NG")}`;
+
+const buildProjectDocumentPdf = (projectDocument) => {
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  const margin = 18;
+  const usableWidth = 174;
+  let y = 20;
+
+  const ensureRoom = (height = 12) => {
+    if (y + height > 278) {
+      doc.addPage();
+      y = 20;
+    }
+  };
+
+  const writeWrapped = (text, x, width, lineHeight = 5) => {
+    const lines = doc.splitTextToSize(String(text || ""), width);
+    ensureRoom(lines.length * lineHeight + 2);
+    doc.text(lines, x, y);
+    y += lines.length * lineHeight;
+  };
+
+  doc.setFillColor(15, 79, 72);
+  doc.rect(0, 0, 210, 38, "F");
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(19);
+  doc.setFont("helvetica", "bold");
+  doc.text("BuiltRight Services Ltd", margin, 18);
+  doc.setFontSize(10);
+  doc.setFont("helvetica", "normal");
+  doc.text(
+    projectDocument.type === "invoice" ? "PROJECT INVOICE" : "SOLAR PROJECT QUOTATION",
+    margin,
+    29
+  );
+
+  y = 49;
+  doc.setTextColor(25, 36, 33);
+  doc.setFontSize(10);
+  doc.setFont("helvetica", "bold");
+  doc.text(`Reference: ${projectDocument.reference}`, margin, y);
+  doc.text(`Status: ${String(projectDocument.status).toUpperCase()}`, 125, y);
+  y += 8;
+  doc.setFont("helvetica", "normal");
+  doc.text(`Customer: ${projectDocument.customer?.fullName || "Customer"}`, margin, y);
+  doc.text(`Date: ${new Date(projectDocument.createdAt || Date.now()).toLocaleDateString("en-GB")}`, 125, y);
+  y += 6;
+  doc.text(`Email: ${projectDocument.customer?.email || ""}`, margin, y);
+  if (projectDocument.validUntil) {
+    doc.text(`Valid until: ${new Date(projectDocument.validUntil).toLocaleDateString("en-GB")}`, 125, y);
+  }
+  y += 11;
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(12);
+  doc.text(projectDocument.title || "Solar Project", margin, y);
+  y += 7;
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  writeWrapped(
+    [
+      projectDocument.project?.systemCapacity,
+      projectDocument.project?.systemName,
+      projectDocument.project?.siteAddress,
+    ].filter(Boolean).join(" | "),
+    margin,
+    usableWidth
+  );
+
+  y += 4;
+  doc.setFillColor(237, 246, 243);
+  doc.rect(margin, y, usableWidth, 8, "F");
+  doc.setFont("helvetica", "bold");
+  doc.text("PROJECT COST BREAKDOWN", margin + 3, y + 5.4);
+  y += 13;
+
+  (projectDocument.lineItems || []).forEach((item, index) => {
+    ensureRoom(15);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    writeWrapped(`${index + 1}. ${item.description}`, margin, 112, 4.5);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.text(`${Number(item.quantity || 0)} ${item.unit || "item"}`, margin + 115, y - 4.5);
+    doc.text(formatDocumentMoney(item.amount), margin + 138, y - 4.5);
+    doc.setDrawColor(229, 235, 233);
+    doc.line(margin, y, margin + usableWidth, y);
+    y += 4;
+  });
+
+  ensureRoom(39);
+  y += 4;
+  doc.setFontSize(9);
+  doc.text("Subtotal", 122, y);
+  doc.text(formatDocumentMoney(projectDocument.subtotal), 156, y);
+  y += 6;
+  if (Number(projectDocument.discount || 0) > 0) {
+    doc.text("Discount", 122, y);
+    doc.text(`- ${formatDocumentMoney(projectDocument.discount)}`, 156, y);
+    y += 6;
+  }
+  if (Number(projectDocument.tax || 0) > 0) {
+    doc.text("Tax", 122, y);
+    doc.text(formatDocumentMoney(projectDocument.tax), 156, y);
+    y += 6;
+  }
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(12);
+  doc.text("Total", 122, y);
+  doc.text(formatDocumentMoney(projectDocument.total), 156, y);
+  y += 11;
+
+  if (projectDocument.type === "quotation") {
+    doc.setFontSize(9);
+    doc.text(
+      `Customer equity (${Number(projectDocument.equityPercentage || 20)}%): ${formatDocumentMoney(projectDocument.equityAmount)}`,
+      margin,
+      y
+    );
+    y += 6;
+    doc.text(`Requested bank finance: ${formatDocumentMoney(projectDocument.bankFinanceAmount)}`, margin, y);
+    y += 10;
+  }
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(9);
+  doc.text("Project scope and notes", margin, y);
+  y += 6;
+  doc.setFont("helvetica", "normal");
+  writeWrapped(projectDocument.project?.scope || projectDocument.notes || "As described in the approved project assessment.", margin, usableWidth);
+
+  if (projectDocument.terms) {
+    y += 5;
+    doc.setFont("helvetica", "bold");
+    doc.text("Terms", margin, y);
+    y += 6;
+    doc.setFont("helvetica", "normal");
+    writeWrapped(projectDocument.terms, margin, usableWidth);
+  }
+
+  ensureRoom(20);
+  y += 8;
+  doc.setDrawColor(15, 79, 72);
+  doc.line(margin, y, margin + usableWidth, y);
+  y += 7;
+  doc.setFontSize(8);
+  doc.setTextColor(77, 91, 87);
+  writeWrapped(
+    "BuiltRight Services Ltd | 1b Adeniji Street, Off Odusami Street, Ogba, Lagos | info@builtrightltd.com",
+    margin,
+    usableWidth,
+    4
+  );
+
+  return Buffer.from(doc.output("arraybuffer"));
 };
 
 const buildReceiptHtml = (order) => {
@@ -174,24 +796,6 @@ const buildReceiptHtml = (order) => {
     </div>
   `;
 };
-const getBankEmail = (financeInstitution) => {
-  const bankEmails = {
-    "Rich Green Microfinance Bank":
-      "builtrightenergy@gmail.com",
-
-    "Premium Trust Bank":
-      "builtrightenergy@gmail.com",
-
-    "Zenith Bank":
-      "builtrightenergy@gmail.com",
-  };
-
-  return (
-    bankEmails[financeInstitution] ||
-    "builtrightenergy@gmail.com"
-  );
-};
-
 /* =========================
    BASIC
 ========================= */
@@ -603,6 +1207,7 @@ app.post("/api/orders/finalize", async (req, res) => {
         fullName: customer.fullName,
         email: customer.email,
         phone: customer.phone,
+        location: customer.location || "",
       },
       items: cartItems,
       amount: amount ?? null,
@@ -767,7 +1372,7 @@ app.post("/api/loan-request", async (req, res) => {
 
     const selectedProductSource = productSource || "BuiltRight Marketplace";
     const selectedFinanceInstitution =
-      financeInstitution || "Rich Green Microfinance Bank";
+      financeInstitution || "Bank partner pending";
 
     if (!customer?.fullName || !customer?.email || !customer?.phone) {
       return res.status(400).json({
@@ -830,6 +1435,7 @@ app.post("/api/loan-request", async (req, res) => {
         fullName: customer.fullName,
         email: customer.email,
         phone: customer.phone,
+        location: customer.location || "",
       },
       productSource: selectedProductSource,
       financeInstitution: selectedFinanceInstitution,
@@ -844,7 +1450,29 @@ app.post("/api/loan-request", async (req, res) => {
       consentToShare: Boolean(consentToShare),
       thirdPartyNoticeAccepted: Boolean(thirdPartyNoticeAccepted),
       preferredContact: "WhatsApp",
-      status: "pending",
+      assessment: {
+        status: "open",
+        triggeredAt: new Date(),
+        dueDiligence: {
+          status: "pending",
+          result: "pending",
+          checklist: [
+            { key: "identity-contact", label: "Customer identity and contact verified", status: "pending" },
+            { key: "property-authority", label: "Property ownership or installation authority verified", status: "pending" },
+            { key: "site-access", label: "Site access and installation permissions confirmed", status: "pending" },
+            { key: "technical-suitability", label: "Roof, electrical, and structural suitability confirmed", status: "pending" },
+            { key: "financing-consent", label: "Financing data-sharing consent recorded", status: "pending" },
+          ],
+        },
+      },
+      status: "submitted",
+      statusHistory: [
+        {
+          status: "submitted",
+          source: "customer",
+          note: "Customer submitted a financing request.",
+        },
+      ],
       notes: notes || "",
     });
 
@@ -859,7 +1487,7 @@ app.post("/api/loan-request", async (req, res) => {
           <p><strong>Phone:</strong> ${customer.phone}</p>
           <p><strong>Product Source:</strong> ${selectedProductSource}</p>
           <p><strong>Finance Institution:</strong> ${selectedFinanceInstitution}</p>
-          <p><strong>Status:</strong> pending</p>
+          <p><strong>Status:</strong> submitted</p>
         `,
       });
     } catch (mailError) {
@@ -925,11 +1553,425 @@ app.delete("/api/loan-requests/:id", requireAdminAuth, async (req, res) => {
     });
   }
 });
+
+app.get("/api/loan-requests/:id/workspace", requireAdminAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findById(req.params.id).lean();
+    if (!loanRequest) {
+      return res.status(404).json({ status: false, message: "Financing case not found." });
+    }
+    const documents = await ProjectDocument.find({ financingRequest: loanRequest._id })
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({ status: true, loanRequest, documents });
+  } catch (error) {
+    console.error("LOAD FINANCING WORKSPACE ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load the financing workspace." });
+  }
+});
+
+app.patch("/api/loan-requests/:id/assessment", requireAdminAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findById(req.params.id);
+    if (!loanRequest) {
+      return res.status(404).json({ status: false, message: "Financing case not found." });
+    }
+
+    const { inspection, loadAudit, dueDiligence } = req.body;
+    loanRequest.assessment ||= {};
+    loanRequest.assessment.inspection ||= {};
+    loanRequest.assessment.loadAudit ||= {};
+    loanRequest.assessment.dueDiligence ||= { checklist: [] };
+    const allowedInspectionFields = ["status", "result", "completedBy", "notes"];
+    const allowedLoadAuditFields = [
+      "status",
+      "result",
+      "peakLoadKw",
+      "dailyEnergyKwh",
+      "criticalLoadKw",
+      "recommendedInverterKva",
+      "recommendedBatteryKwh",
+      "recommendedSolarKw",
+      "backupHours",
+      "appliances",
+      "completedBy",
+      "notes",
+    ];
+    const allowedDueDiligenceFields = ["status", "result", "checklist", "completedBy", "notes"];
+
+    const assignAllowed = (target, source, fields) => {
+      if (!source) return;
+      fields.forEach((field) => {
+        if (Object.prototype.hasOwnProperty.call(source, field)) {
+          target[field] = source[field];
+        }
+      });
+    };
+
+    assignAllowed(loanRequest.assessment.inspection, inspection, allowedInspectionFields);
+    assignAllowed(loanRequest.assessment.loadAudit, loadAudit, allowedLoadAuditFields);
+    assignAllowed(loanRequest.assessment.dueDiligence, dueDiligence, allowedDueDiligenceFields);
+
+    if (loanRequest.assessment.inspection.status === "completed") {
+      loanRequest.assessment.inspection.completedAt ||= new Date();
+      loanRequest.inspection.status = "completed";
+      loanRequest.inspection.completedAt ||= new Date();
+    }
+    if (loanRequest.assessment.loadAudit.status === "completed") {
+      loanRequest.assessment.loadAudit.completedAt ||= new Date();
+    }
+    if (loanRequest.assessment.dueDiligence.status === "completed") {
+      loanRequest.assessment.dueDiligence.completedAt ||= new Date();
+    }
+
+    const inspectionPassed =
+      loanRequest.assessment.inspection.status === "completed" &&
+      loanRequest.assessment.inspection.result === "pass";
+    const loadAuditHasSizing = [
+      loanRequest.assessment.loadAudit.peakLoadKw,
+      loanRequest.assessment.loadAudit.dailyEnergyKwh,
+      loanRequest.assessment.loadAudit.recommendedInverterKva,
+      loanRequest.assessment.loadAudit.recommendedBatteryKwh,
+      loanRequest.assessment.loadAudit.recommendedSolarKw,
+    ].every((value) => Number(value) > 0);
+    const loadAuditPassed =
+      loanRequest.assessment.loadAudit.status === "completed" &&
+      loanRequest.assessment.loadAudit.result === "pass" &&
+      loadAuditHasSizing;
+    const dueDiligenceChecklist = loanRequest.assessment.dueDiligence.checklist || [];
+    const dueDiligencePassed =
+      loanRequest.assessment.dueDiligence.status === "completed" &&
+      loanRequest.assessment.dueDiligence.result === "pass" &&
+      dueDiligenceChecklist.length > 0 &&
+      dueDiligenceChecklist.every(
+        (item) => ["pass", "not-applicable"].includes(item.status)
+      );
+    const assessmentFailed = [
+      loanRequest.assessment.inspection.result,
+      loanRequest.assessment.loadAudit.result,
+      loanRequest.assessment.dueDiligence.result,
+    ].includes("fail");
+
+    if (assessmentFailed) {
+      loanRequest.assessment.status = "failed";
+      loanRequest.status = "due-diligence-failed";
+    } else if (inspectionPassed && loadAuditPassed && dueDiligencePassed) {
+      loanRequest.assessment.status = "passed";
+      loanRequest.status = "due-diligence-passed";
+    } else {
+      loanRequest.assessment.status = "in-progress";
+      loanRequest.status = loadAuditPassed
+        ? "load-audit-completed"
+        : inspectionPassed
+          ? "inspection-completed"
+          : loanRequest.assessment.inspection.status === "scheduled"
+            ? "inspection-scheduled"
+            : "internal-review";
+    }
+
+    loanRequest.statusHistory.push({
+      status: loanRequest.status,
+      source: "admin",
+      note: `Pre-credit assessment updated by ${req.admin?.email || "BuiltRight admin"}.`,
+    });
+    await loanRequest.save();
+
+    return res.json({
+      status: true,
+      message:
+        loanRequest.assessment.status === "passed"
+          ? "Inspection, load audit, and due diligence passed. Quotation preparation is now unlocked."
+          : "Assessment record updated.",
+      loanRequest,
+    });
+  } catch (error) {
+    console.error("UPDATE ASSESSMENT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not update the assessment." });
+  }
+});
+
+app.post("/api/loan-requests/:id/quotation", requireAdminAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findById(req.params.id);
+    if (!loanRequest) {
+      return res.status(404).json({ status: false, message: "Financing case not found." });
+    }
+
+    if (loanRequest.assessment?.status !== "passed") {
+      return res.status(409).json({
+        status: false,
+        code: "ASSESSMENT_NOT_PASSED",
+        message: "Quotation is locked until inspection, load audit, and due diligence all pass.",
+      });
+    }
+
+    const sourceItems = Array.isArray(req.body.lineItems) ? req.body.lineItems : [];
+    if (sourceItems.length === 0) {
+      return res.status(400).json({ status: false, message: "Add at least one quotation line item." });
+    }
+
+    const lineItems = sourceItems.map((item) => {
+      const quantity = Math.max(0, Number(item.quantity || 0));
+      const unitPrice = Math.max(0, Number(item.unitPrice || 0));
+      return {
+        category: item.category || "other",
+        description: String(item.description || "").trim(),
+        quantity,
+        unit: String(item.unit || "item").trim(),
+        unitPrice,
+        amount: Math.round(quantity * unitPrice * 100) / 100,
+        source: item.source || "manual",
+      };
+    });
+
+    if (lineItems.some((item) => !item.description)) {
+      return res.status(400).json({ status: false, message: "Every quotation item needs a description." });
+    }
+
+    const subtotal = lineItems.reduce((sum, item) => sum + item.amount, 0);
+    const discount = Math.max(0, Number(req.body.discount || 0));
+    const tax = Math.max(0, Number(req.body.tax || 0));
+    const total = Math.max(0, subtotal - discount + tax);
+    if (total <= 0) {
+      return res.status(400).json({ status: false, message: "The final project quotation must have a positive total." });
+    }
+    const equityPercentage = 20;
+    const equityAmount = Math.round(total * (equityPercentage / 100) * 100) / 100;
+    const bankFinanceAmount = Math.round((total - equityAmount) * 100) / 100;
+    const version = (await ProjectDocument.countDocuments({
+      financingRequest: loanRequest._id,
+      type: "quotation",
+    })) + 1;
+    const firstItem = loanRequest.items?.[0];
+    const reference = `BRQ-${String(loanRequest.reference || loanRequest._id).replace(/^BRF-/, "")}-V${version}`;
+
+    const quotation = await ProjectDocument.create({
+      reference,
+      financingRequest: loanRequest._id,
+      type: "quotation",
+      version,
+      status: "draft",
+      title: req.body.title || `${firstItem?.capacity || "Solar"} project quotation`,
+      customer: {
+        fullName: loanRequest.customer.fullName,
+        email: loanRequest.customer.email,
+        phone: loanRequest.customer.phone,
+        location: loanRequest.customer.location || "",
+      },
+      project: {
+        systemName: req.body.project?.systemName || firstItem?.name || "Solar power system",
+        systemCapacity: req.body.project?.systemCapacity || firstItem?.capacity || "",
+        propertyType: req.body.project?.propertyType || loanRequest.inspection?.propertyType || "",
+        cableDistance: req.body.project?.cableDistance || loanRequest.inspection?.cableDistance || "",
+        mountingMethod: req.body.project?.mountingMethod || loanRequest.inspection?.mountingMethod || "",
+        siteAddress: req.body.project?.siteAddress || loanRequest.customer.location || "",
+        scope: req.body.project?.scope || "",
+      },
+      lineItems,
+      subtotal,
+      discount,
+      tax,
+      total,
+      equityPercentage,
+      equityAmount,
+      bankFinanceAmount,
+      terms: req.body.terms || "Quotation is subject to customer approval and bank credit approval. Work begins only after the equity deposit and bank disbursement are confirmed.",
+      notes: req.body.notes || "",
+      validUntil: req.body.validUntil || null,
+      createdBy: req.admin?.email || "BuiltRight operations",
+    });
+
+    loanRequest.finalProjectCost = total;
+    loanRequest.deposit.percentage = equityPercentage;
+    loanRequest.deposit.amount = equityAmount;
+    loanRequest.quotation = {
+      status: "draft",
+      document: quotation._id,
+      reference: quotation.reference,
+      version,
+      sentAt: null,
+      approvedAt: null,
+      changesRequestedAt: null,
+    };
+    loanRequest.status = "quotation-draft";
+    loanRequest.statusHistory.push({
+      status: "quotation-draft",
+      source: "admin",
+      note: `Quotation ${quotation.reference} prepared from the passed assessment.`,
+    });
+    await loanRequest.save();
+
+    return res.status(201).json({
+      status: true,
+      message: "Quotation draft generated.",
+      quotation,
+      loanRequest,
+    });
+  } catch (error) {
+    console.error("CREATE QUOTATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: error.message || "Could not generate quotation." });
+  }
+});
+
+app.post("/api/loan-requests/:id/quotation/:documentId/send", requireAdminAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findById(req.params.id);
+    const quotation = await ProjectDocument.findOne({
+      _id: req.params.documentId,
+      financingRequest: req.params.id,
+      type: "quotation",
+    });
+    if (!loanRequest || !quotation) {
+      return res.status(404).json({ status: false, message: "Quotation not found." });
+    }
+    if (loanRequest.assessment?.status !== "passed") {
+      return res.status(409).json({ status: false, message: "The assessment must pass before a quotation can be sent." });
+    }
+    if (quotation.status !== "draft") {
+      return res.status(409).json({ status: false, message: "Only a draft quotation can be sent to the customer." });
+    }
+
+    const pdf = buildProjectDocumentPdf(quotation);
+    const portalUrl = `${process.env.FRONTEND_URL || "https://builtright-frontend.vercel.app"}/customer/documents`;
+
+    try {
+      await sendEmail({
+        to: quotation.customer.email,
+        subject: `BuiltRight Project Quotation ${quotation.reference}`,
+        html: `
+          <div style="font-family:Arial,sans-serif;line-height:1.7;color:#1c2b27;max-width:680px;margin:auto;">
+            <h2>Your BuiltRight solar project quotation is ready</h2>
+            <p>Hello ${escapeHtml(quotation.customer.fullName)},</p>
+            <p>BuiltRight has completed the site inspection, load audit, and due-diligence review for your financing request.</p>
+            <div style="background:#edf6f3;padding:18px;border-radius:12px;margin:18px 0;">
+              <p><strong>Quotation:</strong> ${escapeHtml(quotation.reference)}</p>
+              <p><strong>Total project cost:</strong> ${formatDocumentMoney(quotation.total)}</p>
+              <p><strong>Your ${quotation.equityPercentage}% equity:</strong> ${formatDocumentMoney(quotation.equityAmount)}</p>
+              <p><strong>Requested bank finance:</strong> ${formatDocumentMoney(quotation.bankFinanceAmount)}</p>
+            </div>
+            <p>The full quotation is attached. Sign in to your BuiltRight customer portal to view, download, approve, or request changes.</p>
+            <p><a href="${portalUrl}" style="display:inline-block;background:#c92b32;color:white;text-decoration:none;padding:12px 18px;border-radius:8px;font-weight:bold;">Review quotation</a></p>
+          </div>
+        `,
+        attachments: [
+          {
+            filename: `BuiltRight-Quotation-${quotation.reference}.pdf`,
+            content: pdf,
+            contentType: "application/pdf",
+          },
+        ],
+      });
+      quotation.emailDelivery = { status: "sent", sentAt: new Date(), error: "" };
+    } catch (mailError) {
+      quotation.emailDelivery = { status: "failed", sentAt: null, error: mailError.message };
+      await quotation.save();
+      return res.status(502).json({
+        status: false,
+        message: "Quotation was generated, but the customer email could not be delivered.",
+      });
+    }
+
+    quotation.status = "sent";
+    quotation.sentAt = new Date();
+    await quotation.save();
+
+    loanRequest.quotation ||= {};
+    loanRequest.quotation.status = "sent";
+    loanRequest.quotation.document = quotation._id;
+    loanRequest.quotation.reference = quotation.reference;
+    loanRequest.quotation.sentAt = quotation.sentAt;
+    loanRequest.status = "quotation-sent";
+    loanRequest.statusHistory.push({
+      status: "quotation-sent",
+      source: "admin",
+      note: `Quotation ${quotation.reference} emailed to the customer for approval.`,
+    });
+    await loanRequest.save();
+
+    return res.json({ status: true, message: "Quotation emailed to the customer.", quotation, loanRequest });
+  } catch (error) {
+    console.error("SEND QUOTATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not send the quotation." });
+  }
+});
+
+app.post("/api/loan-requests/:id/documents/:documentId/send", requireAdminAuth, async (req, res) => {
+  try {
+    const projectDocument = await ProjectDocument.findOne({
+      _id: req.params.documentId,
+      financingRequest: req.params.id,
+    });
+    if (!projectDocument) {
+      return res.status(404).json({ status: false, message: "Project document not found." });
+    }
+    if (projectDocument.type !== "invoice" || projectDocument.status !== "issued") {
+      return res.status(409).json({
+        status: false,
+        message: "Use the quotation approval workflow for quotations. Only issued invoices can be sent here.",
+      });
+    }
+
+    try {
+      const pdf = buildProjectDocumentPdf(projectDocument);
+      const portalUrl = `${process.env.FRONTEND_URL || "https://builtright-frontend.vercel.app"}/customer/documents`;
+      await sendEmail({
+        to: projectDocument.customer.email,
+        subject: `BuiltRight Project Invoice ${projectDocument.reference}`,
+        html: `
+          <div style="font-family:Arial,sans-serif;line-height:1.7;color:#1c2b27;max-width:680px;margin:auto;">
+            <h2>Your BuiltRight project invoice is ready</h2>
+            <p>Hello ${escapeHtml(projectDocument.customer.fullName)},</p>
+            <p>Your equity payment and the bank's disbursement have been confirmed. Your project invoice is attached.</p>
+            <p>BuiltRight's delivery and installation team will contact you with the schedule and site instructions.</p>
+            <p><a href="${portalUrl}" style="display:inline-block;background:#168f82;color:white;text-decoration:none;padding:12px 18px;border-radius:8px;font-weight:bold;">View project documents</a></p>
+          </div>
+        `,
+        attachments: [{
+          filename: `BuiltRight-Invoice-${projectDocument.reference}.pdf`,
+          content: pdf,
+          contentType: "application/pdf",
+        }],
+      });
+      projectDocument.emailDelivery = { status: "sent", sentAt: new Date(), error: "" };
+      projectDocument.sentAt ||= new Date();
+      await projectDocument.save();
+      return res.json({ status: true, message: "Invoice emailed to the customer.", document: projectDocument });
+    } catch (mailError) {
+      projectDocument.emailDelivery = { status: "failed", sentAt: null, error: mailError.message };
+      await projectDocument.save();
+      return res.status(502).json({ status: false, message: "The invoice email could not be delivered." });
+    }
+  } catch (error) {
+    console.error("SEND PROJECT DOCUMENT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not send the project document." });
+  }
+});
+
 app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) => {
   try {
     const { status } = req.body;
 
     const allowedStatuses = [
+      "submitted",
+      "internal-review",
+      "inspection-scheduled",
+      "inspection-completed",
+      "load-audit-completed",
+      "due-diligence-passed",
+      "due-diligence-failed",
+      "quotation-draft",
+      "quotation-sent",
+      "quotation-approved",
+      "quotation-prepared",
+      "kyc-submitted",
+      "credit-review",
+      "rejected",
+      "awaiting-deposit",
+      "deposit-paid",
+      "awaiting-disbursement",
+      "disbursed",
+      "order-created",
+      "installation-in-progress",
       "pending",
       "contacted",
       "sent-to-bank",
@@ -956,10 +1998,57 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
       });
     }
 
-    let createdOrder = null;
+    const workflowManagedStatuses = [
+      "inspection-completed",
+      "load-audit-completed",
+      "due-diligence-passed",
+      "due-diligence-failed",
+      "quotation-draft",
+      "quotation-sent",
+      "quotation-approved",
+      "quotation-prepared",
+    ];
+    if (workflowManagedStatuses.includes(status)) {
+      return res.status(409).json({
+        status: false,
+        code: "DEDICATED_WORKFLOW_REQUIRED",
+        message: "This stage is controlled by the assessment, quotation, or customer-approval workflow.",
+      });
+    }
 
-    if (status === "approved") {
-      const financingReference = `LOAN-${loanRequest._id}`;
+    const bankControlledStatuses = [
+      "sent-to-bank",
+      "kyc-submitted",
+      "credit-review",
+      "approved",
+      "awaiting-deposit",
+      "deposit-paid",
+      "awaiting-disbursement",
+      "disbursed",
+    ];
+    if (
+      bankControlledStatuses.includes(status) &&
+      loanRequest.quotation?.status !== "approved"
+    ) {
+      return res.status(409).json({
+        status: false,
+        code: "CUSTOMER_QUOTATION_APPROVAL_REQUIRED",
+        message: "The customer must approve the final quotation before the bank application can begin.",
+      });
+    }
+    if (status === "sent-to-bank" && !loanRequest.bankApplication?.redirectUrl) {
+      return res.status(409).json({
+        status: false,
+        code: "BANK_APPLICATION_LINK_REQUIRED",
+        message: "The bank's hosted credit application link has not been configured.",
+      });
+    }
+
+    let createdOrder = null;
+    let createdInvoice = null;
+
+    if (status === "disbursed") {
+      const financingReference = `FIN-${loanRequest.reference || loanRequest._id}`;
 
       const existingOrder = await Order.findOne({
         reference: financingReference,
@@ -1014,21 +2103,162 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
           },
 
           items: safeItems,
-          amount: loanRequest.estimatedAmount ?? null,
+          amount: loanRequest.finalProjectCost ?? loanRequest.estimatedAmount ?? null,
           date: new Date().toLocaleDateString(),
-          status: "Financing Approved",
+          status: "Confirmed",
           financingRequestId: loanRequest._id,
         });
       } else {
         createdOrder = existingOrder;
       }
+
+      const existingInvoice = await ProjectDocument.findOne({
+        financingRequest: loanRequest._id,
+        type: "invoice",
+      });
+      if (!existingInvoice && createdOrder) {
+        const approvedQuotation = await ProjectDocument.findOne({
+          financingRequest: loanRequest._id,
+          type: "quotation",
+          status: "approved",
+        }).sort({ version: -1 });
+        const invoiceLineItems = approvedQuotation?.lineItems?.length
+          ? approvedQuotation.lineItems.map((item) => ({
+              category: item.category,
+              description: item.description,
+              quantity: item.quantity,
+              unit: item.unit,
+              unitPrice: item.unitPrice,
+              amount: item.amount,
+              source: item.source,
+            }))
+          : safeItems.map((item) => ({
+              category: "other",
+              description: item.name,
+              quantity: item.quantity,
+              unit: "item",
+              unitPrice: Number(item.price || 0),
+              amount: Number(item.price || 0) * Number(item.quantity || 1),
+              source: "confirmed",
+            }));
+        const invoiceTotal = Number(
+          loanRequest.finalProjectCost ?? createdOrder.amount ?? loanRequest.estimatedAmount ?? 0
+        );
+        createdInvoice = await ProjectDocument.create({
+          reference: `BRI-${String(loanRequest.reference || loanRequest._id).replace(/^BRF-/, "")}`,
+          financingRequest: loanRequest._id,
+          order: createdOrder._id,
+          type: "invoice",
+          version: 1,
+          status: "issued",
+          title: approvedQuotation?.title || "BuiltRight financed solar project invoice",
+          customer: {
+            fullName: loanRequest.customer.fullName,
+            email: loanRequest.customer.email,
+            phone: loanRequest.customer.phone,
+            location: loanRequest.customer.location || "",
+          },
+          project: approvedQuotation?.project || {
+            systemName: safeItems[0]?.name || "Solar power system",
+            systemCapacity: safeItems[0]?.capacity || "",
+            siteAddress: loanRequest.customer.location || "",
+          },
+          lineItems: invoiceLineItems,
+          subtotal: approvedQuotation?.subtotal ?? invoiceTotal,
+          discount: approvedQuotation?.discount ?? 0,
+          tax: approvedQuotation?.tax ?? 0,
+          total: invoiceTotal,
+          equityPercentage: loanRequest.deposit?.percentage || 20,
+          equityAmount: loanRequest.deposit?.amount || invoiceTotal * 0.2,
+          bankFinanceAmount: loanRequest.bankApplication?.disbursedAmount || invoiceTotal * 0.8,
+          terms: "Invoice issued after customer equity and bank disbursement were confirmed.",
+          notes: "This invoice forms part of the customer's BuiltRight document history.",
+          createdBy: req.admin?.email || "BuiltRight operations",
+        });
+      } else {
+        createdInvoice = existingInvoice;
+      }
     }
 
     loanRequest.status = status;
+    loanRequest.statusHistory.push({
+      status,
+      source: "admin",
+      note:
+        status === "disbursed"
+          ? "Verified bank disbursement received; confirmed order created."
+          : "Financing stage updated from the operations portal.",
+    });
     await loanRequest.save();
 
     try {
   const statusMessages = {
+    submitted: {
+      title: "Financing Request Received",
+      message:
+        "Your financing request has been received and is awaiting BuiltRight review.",
+    },
+
+    "internal-review": {
+      title: "BuiltRight Review in Progress",
+      message:
+        "Our team is reviewing your selected system and preparing the next steps for site inspection.",
+    },
+
+    "inspection-scheduled": {
+      title: "Site Inspection Scheduled",
+      message:
+        "Your site inspection has been scheduled. We will confirm the property, cable distance, mounting requirements, and protection accessories.",
+    },
+
+    "inspection-completed": {
+      title: "Site Inspection Completed",
+      message:
+        "Your site inspection is complete and BuiltRight is finalizing the installation materials and total project cost.",
+    },
+
+    "load-audit-completed": {
+      title: "Load Audit Completed",
+      message:
+        "Your energy-use assessment is complete. BuiltRight is finalizing technical suitability and due diligence.",
+    },
+
+    "due-diligence-passed": {
+      title: "Pre-Credit Assessment Passed",
+      message:
+        "Your inspection, load audit, and BuiltRight due-diligence checks passed. We can now prepare the full project quotation.",
+    },
+
+    "due-diligence-failed": {
+      title: "Pre-Credit Assessment Needs Attention",
+      message:
+        "One or more inspection or due-diligence items need to be resolved before a final quotation can be prepared.",
+    },
+
+    "quotation-draft": {
+      title: "Quotation Being Prepared",
+      message:
+        "BuiltRight is preparing the detailed project quotation from the completed assessment.",
+    },
+
+    "quotation-sent": {
+      title: "Quotation Sent for Your Approval",
+      message:
+        "Your detailed project quotation is available in your BuiltRight documents. Review and approve it before starting the bank application.",
+    },
+
+    "quotation-approved": {
+      title: "Quotation Approved",
+      message:
+        "Your quotation approval has been recorded. The bank credit application will unlock when the bank-hosted link is available.",
+    },
+
+    "quotation-prepared": {
+      title: "Final Quotation Prepared",
+      message:
+        "Your final project quotation has been prepared and is ready for financing handoff.",
+    },
+
     pending: {
       title: "Financing Request Received",
       message:
@@ -1053,10 +2283,64 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
         "Your financing request is currently undergoing assessment and eligibility review.",
     },
 
+    "kyc-submitted": {
+      title: "KYC Submitted",
+      message:
+        "Your identity and account information has been submitted to the financing provider for review.",
+    },
+
+    "credit-review": {
+      title: "Credit Review in Progress",
+      message:
+        "The financing provider is reviewing your application. BuiltRight will update you when a decision is received.",
+    },
+
     approved: {
       title: "Financing Approved",
       message:
         "Congratulations. Your financing request has been approved successfully.",
+    },
+
+    "awaiting-deposit": {
+      title: "20% Deposit Required",
+      message:
+        "Your financing is approved. Please complete the required 20% deposit of the approved total project cost.",
+    },
+
+    "deposit-paid": {
+      title: "Deposit Confirmed",
+      message:
+        "Your deposit has been confirmed. We are now awaiting the remaining financing disbursement.",
+    },
+
+    "awaiting-disbursement": {
+      title: "Awaiting Bank Disbursement",
+      message:
+        "Your deposit is complete and BuiltRight is awaiting the financing provider's disbursement before releasing the order.",
+    },
+
+    disbursed: {
+      title: "Financing Disbursed",
+      message:
+        "The financing disbursement has been confirmed. BuiltRight has created your confirmed order and invoice.",
+    },
+
+    "order-created": {
+      title: "Order and Invoice Created",
+      message:
+        "Your confirmed order and invoice have been created. Delivery and installation planning can now begin.",
+    },
+
+    "installation-in-progress": {
+      title: "Installation in Progress",
+      message:
+        "Your BuiltRight solar installation is currently in progress.",
+    },
+
+    rejected: {
+      title: "Financing Request Not Approved",
+      message:
+        "The financing provider did not approve the application at this time. BuiltRight will contact you about available next steps.",
     },
 
     "installation-scheduled": {
@@ -1079,7 +2363,7 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
   };
 
   const currentStatus =
-    statusMessages[status] || statusMessages.pending;
+    statusMessages[status] || statusMessages.submitted;
 
   await sendEmail({
     to: loanRequest.customer.email,
@@ -1110,7 +2394,7 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
           </p>
 
           <p>
-            <strong>Estimated Amount:</strong>
+            <strong>Selected System Estimate (installation and materials excluded):</strong>
             ${
               loanRequest.estimatedAmount
                 ? formatCurrency(loanRequest.estimatedAmount)
@@ -1137,52 +2421,88 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
   );
 }
 
-    if (status === "sent-to-bank") {
-  try {
-    const bankEmail = getBankEmail(loanRequest.financeInstitution);
+    if (status === "disbursed" && createdInvoice && createdInvoice.emailDelivery?.status !== "sent") {
+      try {
+        const invoicePdf = buildProjectDocumentPdf(createdInvoice);
+        const portalUrl = `${process.env.FRONTEND_URL || "https://builtright-frontend.vercel.app"}/customer/documents`;
+        await sendEmail({
+          to: createdInvoice.customer.email,
+          subject: `BuiltRight Project Invoice ${createdInvoice.reference}`,
+          html: `
+            <div style="font-family:Arial,sans-serif;line-height:1.7;color:#1c2b27;max-width:680px;margin:auto;">
+              <h2>Your confirmed BuiltRight project invoice</h2>
+              <p>Hello ${escapeHtml(createdInvoice.customer.fullName)},</p>
+              <p>Your equity payment and bank disbursement are confirmed. The attached invoice records the full approved project cost.</p>
+              <p>Our delivery and installation team will contact you with scheduling and site instructions.</p>
+              <p><a href="${portalUrl}" style="display:inline-block;background:#168f82;color:white;text-decoration:none;padding:12px 18px;border-radius:8px;font-weight:bold;">View project documents</a></p>
+            </div>
+          `,
+          attachments: [{
+            filename: `BuiltRight-Invoice-${createdInvoice.reference}.pdf`,
+            content: invoicePdf,
+            contentType: "application/pdf",
+          }],
+        });
+        createdInvoice.emailDelivery = { status: "sent", sentAt: new Date(), error: "" };
+        createdInvoice.sentAt ||= new Date();
+        await createdInvoice.save();
+      } catch (invoiceMailError) {
+        createdInvoice.emailDelivery = { status: "failed", sentAt: null, error: invoiceMailError.message };
+        await createdInvoice.save();
+        console.error("CUSTOMER INVOICE EMAIL ERROR:", invoiceMailError.message);
+      }
+    }
 
-    await sendEmail({
-      to: bankEmail,
-      subject: `BuiltRight Financing Request - ${loanRequest.customer.fullName}`,
-      html: `
-        <h2>BuiltRight Financing Request</h2>
+    if (status === "sent-to-bank" && process.env.BANK_APPLICATION_EMAIL) {
+      const approvedQuotation = await ProjectDocument.findOne({
+        financingRequest: loanRequest._id,
+        type: "quotation",
+        status: "approved",
+      }).sort({ version: -1 });
 
-        <p><strong>Customer:</strong> ${loanRequest.customer.fullName}</p>
-        <p><strong>Email:</strong> ${loanRequest.customer.email}</p>
-        <p><strong>Phone:</strong> ${loanRequest.customer.phone}</p>
-
-        <p><strong>Finance Institution:</strong> ${loanRequest.financeInstitution}</p>
-        <p><strong>Product Source:</strong> ${loanRequest.productSource}</p>
-        <p><strong>Estimated Amount:</strong> ${formatCurrency(loanRequest.estimatedAmount)}</p>
-
-        <h3>Requested Items</h3>
-        <ul>
-          ${(loanRequest.items || [])
-            .map(
-              (item) =>
-                `<li>${item.name || "Selected Product"} - ${
-                  item.price != null ? formatCurrency(item.price) : "Request Price"
-                }</li>`
-            )
-            .join("")}
-        </ul>
-
-        <h3>Notes</h3>
-        <p>${loanRequest.notes || "No notes provided."}</p>
-      `,
-    });
-
-    console.log("BANK EMAIL SENT TO:", bankEmail);
-  } catch (mailError) {
-    console.error("BANK EMAIL ERROR:", mailError.message);
-  }
-}
+      if (approvedQuotation && approvedQuotation.bankDelivery?.status !== "sent") {
+        try {
+          const pdf = buildProjectDocumentPdf(approvedQuotation);
+          await sendEmail({
+            to: process.env.BANK_APPLICATION_EMAIL,
+            subject: `Customer-Approved BuiltRight Quotation ${approvedQuotation.reference}`,
+            html: `
+              <h2>BuiltRight financing application support document</h2>
+              <p><strong>Customer:</strong> ${escapeHtml(loanRequest.customer.fullName)}</p>
+              <p><strong>Financing reference:</strong> ${escapeHtml(loanRequest.reference)}</p>
+              <p><strong>Quotation:</strong> ${escapeHtml(approvedQuotation.reference)}</p>
+              <p><strong>Total project cost:</strong> ${formatDocumentMoney(approvedQuotation.total)}</p>
+              <p>The customer-approved quotation is attached.</p>
+            `,
+            attachments: [
+              {
+                filename: `BuiltRight-Approved-Quotation-${approvedQuotation.reference}.pdf`,
+                content: pdf,
+                contentType: "application/pdf",
+              },
+            ],
+          });
+          approvedQuotation.bankDelivery = { status: "sent", sentAt: new Date(), error: "" };
+          loanRequest.bankApplication.quotationSharedAt = new Date();
+          await approvedQuotation.save();
+          await loanRequest.save();
+        } catch (mailError) {
+          approvedQuotation.bankDelivery = {
+            status: "failed",
+            sentAt: null,
+            error: mailError.message,
+          };
+          await approvedQuotation.save();
+          console.error("BANK QUOTATION EMAIL ERROR:", mailError.message);
+        }
+      }
+    }
 
     return res.json({
       status: true,
       message:
-        status === "approved"
-          ? "Loan request approved and order created."
+        status === "disbursed"
+          ? "Bank disbursement confirmed and order created."
           : "Loan request status updated.",
       loanRequest,
       order: createdOrder,
@@ -1208,10 +2528,22 @@ app.get("/api/admin/dashboard-stats", requireAdminAuth, async (req, res) => {
     const totalLoanRequests = await LoanRequest.countDocuments();
     const totalCustomers = await User.countDocuments({ role: "customer" });
     const pendingLoanRequests = await LoanRequest.countDocuments({
-      status: "pending",
+      status: { $in: ["submitted", "internal-review", "pending", "contacted"] },
     });
     const approvedLoans = await LoanRequest.countDocuments({
-      status: "approved",
+      status: {
+        $in: [
+          "approved",
+          "awaiting-deposit",
+          "deposit-paid",
+          "awaiting-disbursement",
+          "disbursed",
+          "order-created",
+          "installation-scheduled",
+          "installation-in-progress",
+          "completed",
+        ],
+      },
     });
 
     return res.json({
@@ -1303,6 +2635,218 @@ app.get("/api/customer/loan-requests", requireCustomerAuth, async (req, res) => 
       status: false,
       message: "Failed to load financing requests.",
     });
+  }
+});
+
+app.get("/api/customer/documents", requireCustomerAuth, async (req, res) => {
+  try {
+    const documents = await ProjectDocument.find({
+      "customer.email": req.user.email,
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const financingIds = [...new Set(documents.map((document) => String(document.financingRequest)))];
+    const financingRequests = await LoanRequest.find({ _id: { $in: financingIds } })
+      .select("reference status quotation bankApplication deposit finalProjectCost")
+      .lean();
+    const financingById = new Map(financingRequests.map((item) => [String(item._id), item]));
+
+    return res.json({
+      status: true,
+      documents: documents.map((document) => ({
+        ...document,
+        financing: financingById.get(String(document.financingRequest)) || null,
+      })),
+    });
+  } catch (error) {
+    console.error("CUSTOMER DOCUMENTS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load your documents." });
+  }
+});
+
+app.get("/api/customer/documents/:id/download", requireCustomerAuth, async (req, res) => {
+  try {
+    const projectDocument = await ProjectDocument.findOne({
+      _id: req.params.id,
+      "customer.email": req.user.email,
+    }).lean();
+    if (!projectDocument) {
+      return res.status(404).json({ status: false, message: "Document not found." });
+    }
+
+    const pdf = buildProjectDocumentPdf(projectDocument);
+    const documentLabel = projectDocument.type === "invoice" ? "Invoice" : "Quotation";
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="BuiltRight-${documentLabel}-${projectDocument.reference}.pdf"`
+    );
+    return res.send(pdf);
+  } catch (error) {
+    console.error("DOWNLOAD CUSTOMER DOCUMENT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not download the document." });
+  }
+});
+
+app.post("/api/customer/quotations/:id/approve", requireCustomerAuth, async (req, res) => {
+  try {
+    const quotation = await ProjectDocument.findOne({
+      _id: req.params.id,
+      type: "quotation",
+      "customer.email": req.user.email,
+    });
+    if (!quotation) {
+      return res.status(404).json({ status: false, message: "Quotation not found." });
+    }
+    if (quotation.status !== "sent") {
+      return res.status(409).json({
+        status: false,
+        message: "Only a quotation sent by BuiltRight can be approved.",
+      });
+    }
+
+    const loanRequest = await LoanRequest.findById(quotation.financingRequest);
+    if (!loanRequest) {
+      return res.status(404).json({ status: false, message: "Financing request not found." });
+    }
+
+    const approvedAt = new Date();
+    quotation.status = "approved";
+    quotation.customerDecision = {
+      status: "approved",
+      decidedAt: approvedAt,
+      note: String(req.body.note || "Customer approved the quotation in the BuiltRight portal."),
+    };
+
+    loanRequest.quotation ||= {};
+    loanRequest.bankApplication ||= {};
+    const bankApplicationUrl =
+      loanRequest.bankApplication?.redirectUrl || process.env.BANK_APPLICATION_URL || "";
+    const bankApplicationEmail = process.env.BANK_APPLICATION_EMAIL || "";
+    loanRequest.quotation.status = "approved";
+    loanRequest.quotation.document = quotation._id;
+    loanRequest.quotation.reference = quotation.reference;
+    loanRequest.quotation.approvedAt = approvedAt;
+    loanRequest.bankApplication.redirectUrl = bankApplicationUrl;
+    loanRequest.bankApplication.quotationDocument = quotation._id;
+    loanRequest.bankApplication.customerApprovedAt = approvedAt;
+    loanRequest.bankApplication.status = bankApplicationUrl
+      ? "ready-for-customer"
+      : "awaiting-bank-link";
+    loanRequest.status = "quotation-approved";
+    loanRequest.statusHistory.push({
+      status: "quotation-approved",
+      source: "customer",
+      note: `Customer approved quotation ${quotation.reference}.`,
+    });
+
+    if (bankApplicationEmail) {
+      quotation.bankDelivery.status = "pending";
+      try {
+        const pdf = buildProjectDocumentPdf(quotation);
+        await sendEmail({
+          to: bankApplicationEmail,
+          subject: `Customer-Approved BuiltRight Quotation ${quotation.reference}`,
+          html: `
+            <div style="font-family:Arial,sans-serif;line-height:1.7;color:#1c2b27;">
+              <h2>Customer-approved solar financing quotation</h2>
+              <p><strong>Customer:</strong> ${escapeHtml(quotation.customer.fullName)}</p>
+              <p><strong>Email:</strong> ${escapeHtml(quotation.customer.email)}</p>
+              <p><strong>Phone:</strong> ${escapeHtml(quotation.customer.phone)}</p>
+              <p><strong>BuiltRight financing reference:</strong> ${escapeHtml(loanRequest.reference)}</p>
+              <p><strong>Quotation:</strong> ${escapeHtml(quotation.reference)}</p>
+              <p><strong>Total project cost:</strong> ${formatDocumentMoney(quotation.total)}</p>
+              <p><strong>Customer equity:</strong> ${formatDocumentMoney(quotation.equityAmount)}</p>
+              <p><strong>Requested bank finance:</strong> ${formatDocumentMoney(quotation.bankFinanceAmount)}</p>
+              <p>The approved quotation is attached to support the customer's credit and KYC application.</p>
+            </div>
+          `,
+          attachments: [
+            {
+              filename: `BuiltRight-Approved-Quotation-${quotation.reference}.pdf`,
+              content: pdf,
+              contentType: "application/pdf",
+            },
+          ],
+        });
+        quotation.bankDelivery = { status: "sent", sentAt: new Date(), error: "" };
+        loanRequest.bankApplication.quotationSharedAt = new Date();
+      } catch (mailError) {
+        quotation.bankDelivery = { status: "failed", sentAt: null, error: mailError.message };
+      }
+    }
+
+    await quotation.save();
+    await loanRequest.save();
+
+    return res.json({
+      status: true,
+      message: bankApplicationUrl
+        ? "Quotation approved. Your bank credit application is now available."
+        : "Quotation approved. BuiltRight is awaiting the bank's hosted application link.",
+      quotation,
+      bankApplication: {
+        ready: Boolean(bankApplicationUrl),
+        url: bankApplicationUrl,
+        status: loanRequest.bankApplication.status,
+      },
+    });
+  } catch (error) {
+    console.error("APPROVE QUOTATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not approve the quotation." });
+  }
+});
+
+app.post("/api/customer/quotations/:id/request-changes", requireCustomerAuth, async (req, res) => {
+  try {
+    const note = String(req.body.note || "").trim();
+    if (!note) {
+      return res.status(400).json({ status: false, message: "Please describe the requested changes." });
+    }
+    const quotation = await ProjectDocument.findOne({
+      _id: req.params.id,
+      type: "quotation",
+      "customer.email": req.user.email,
+    });
+    if (!quotation) {
+      return res.status(404).json({ status: false, message: "Quotation not found." });
+    }
+    if (quotation.status !== "sent") {
+      return res.status(409).json({ status: false, message: "This quotation is not awaiting a decision." });
+    }
+
+    quotation.status = "changes-requested";
+    quotation.customerDecision = { status: "changes-requested", decidedAt: new Date(), note };
+    await quotation.save();
+
+    const loanRequest = await LoanRequest.findById(quotation.financingRequest);
+    if (loanRequest) {
+      loanRequest.quotation.status = "changes-requested";
+      loanRequest.quotation.changesRequestedAt = new Date();
+      loanRequest.status = "quotation-draft";
+      loanRequest.statusHistory.push({
+        status: "quotation-draft",
+        source: "customer",
+        note: `Customer requested changes to ${quotation.reference}: ${note}`,
+      });
+      await loanRequest.save();
+    }
+
+    try {
+      await sendEmail({
+        to: process.env.ADMIN_ALERT_EMAIL || process.env.SMTP_USER,
+        subject: `Quotation Changes Requested - ${quotation.reference}`,
+        html: `<p>${escapeHtml(quotation.customer.fullName)} requested changes to ${escapeHtml(quotation.reference)}.</p><p>${escapeHtml(note)}</p>`,
+      });
+    } catch (mailError) {
+      console.error("QUOTATION CHANGE EMAIL ERROR:", mailError.message);
+    }
+
+    return res.json({ status: true, message: "Your change request was sent to BuiltRight.", quotation });
+  } catch (error) {
+    console.error("REQUEST QUOTATION CHANGES ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not send the change request." });
   }
 });
 
