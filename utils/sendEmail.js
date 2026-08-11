@@ -1,6 +1,44 @@
 import nodemailer from "nodemailer";
+import axios from "axios";
 
-const sendEmail = async ({ to, subject, html, cc, bcc, attachments = [] }) => {
+const asRecipients = (recipients) => {
+  if (!recipients) return undefined;
+  return Array.isArray(recipients) ? recipients : [recipients];
+};
+
+const resendAttachments = (attachments) => attachments.map((attachment) => ({
+  filename: attachment.filename,
+  content: Buffer.isBuffer(attachment.content)
+    ? attachment.content.toString("base64")
+    : attachment.content,
+  content_type: attachment.contentType,
+}));
+
+const sendWithResend = async ({ to, subject, html, cc, bcc, attachments }) => {
+  const response = await axios.post(
+    "https://api.resend.com/emails",
+    {
+      from: process.env.RESEND_FROM || "BuiltRight Services <notifications@builtrightltd.com>",
+      to: asRecipients(to),
+      cc: asRecipients(cc),
+      bcc: asRecipients(bcc),
+      subject,
+      html,
+      attachments: resendAttachments(attachments),
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 30000,
+    },
+  );
+
+  return response.data;
+};
+
+const sendWithSmtp = async ({ to, subject, html, cc, bcc, attachments }) => {
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
@@ -31,6 +69,14 @@ const sendEmail = async ({ to, subject, html, cc, bcc, attachments = [] }) => {
   });
 
   return info;
+};
+
+const sendEmail = async (message) => {
+  if (process.env.RESEND_API_KEY) {
+    return sendWithResend(message);
+  }
+
+  return sendWithSmtp(message);
 };
 
 export default sendEmail;
