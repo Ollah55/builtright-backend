@@ -6,7 +6,7 @@ const asRecipients = (recipients) => {
   return Array.isArray(recipients) ? recipients : [recipients];
 };
 
-const resendAttachments = (attachments) => attachments.map((attachment) => ({
+const resendAttachments = (attachments = []) => attachments.map((attachment) => ({
   filename: attachment.filename,
   content: Buffer.isBuffer(attachment.content)
     ? attachment.content.toString("base64")
@@ -14,7 +14,7 @@ const resendAttachments = (attachments) => attachments.map((attachment) => ({
   content_type: attachment.contentType,
 }));
 
-const sendWithResend = async ({ to, subject, html, cc, bcc, attachments }) => {
+const sendWithResend = async ({ to, subject, html, cc, bcc, attachments = [] }) => {
   const response = await axios.post(
     "https://api.resend.com/emails",
     {
@@ -38,7 +38,7 @@ const sendWithResend = async ({ to, subject, html, cc, bcc, attachments }) => {
   return response.data;
 };
 
-const sendWithSmtp = async ({ to, subject, html, cc, bcc, attachments }) => {
+const sendWithSmtp = async ({ to, subject, html, cc, bcc, attachments = [] }) => {
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
