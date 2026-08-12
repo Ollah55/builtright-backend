@@ -1506,6 +1506,7 @@ const chooseInstaller = async (excludedIds = []) => {
     assignments: await LoanRequest.countDocuments({
       "installerAssignment.installer": installer._id,
       "installerAssignment.status": { $in: activeInstallerStatuses },
+      "testRun.isTest": { $ne: true },
     }),
   })));
   workloads.sort((left, right) => left.assignments - right.assignments || left.installer.createdAt - right.installer.createdAt);
@@ -1661,21 +1662,27 @@ const autoCreateAndSendQuotation = async (loanRequest, createdBy) => {
 
   const pdf = buildProjectDocumentPdf(quotation);
   const portalUrl = `${frontendUrl()}/customer/documents`;
-  try {
-    await sendEmail({
-      to: quotation.customer.email,
-      subject: `BuiltRight Project Quotation ${quotation.reference}`,
-      html: `<h2>Your BuiltRight solar project quotation is ready</h2><p>Hello ${safeHtml(quotation.customer.fullName)},</p><p>Your site inspection, load audit, and due-diligence review have passed. Your full project quotation is attached and is now available in your customer profile for download and approval.</p><p><a href="${portalUrl}">Review and accept quotation</a></p>`,
-      attachments: [{ filename: `BuiltRight-Quotation-${quotation.reference}.pdf`, content: pdf, contentType: "application/pdf" }],
-    });
-    quotation.emailDelivery = { status: "sent", sentAt: new Date(), error: "" };
+  if (loanRequest.testRun?.suppressNotifications) {
+    quotation.emailDelivery = { status: "not-sent", sentAt: null, error: "Suppressed for operations test run." };
     quotation.status = "sent";
     quotation.sentAt = new Date();
-  } catch (error) {
-    quotation.emailDelivery = { status: "failed", sentAt: null, error: error.message };
+  } else {
+    try {
+      await sendEmail({
+        to: quotation.customer.email,
+        subject: `BuiltRight Project Quotation ${quotation.reference}`,
+        html: `<h2>Your BuiltRight solar project quotation is ready</h2><p>Hello ${safeHtml(quotation.customer.fullName)},</p><p>Your site inspection, load audit, and due-diligence review have passed. Your full project quotation is attached and is now available in your customer profile for download and approval.</p><p><a href="${portalUrl}">Review and accept quotation</a></p>`,
+        attachments: [{ filename: `BuiltRight-Quotation-${quotation.reference}.pdf`, content: pdf, contentType: "application/pdf" }],
+      });
+      quotation.emailDelivery = { status: "sent", sentAt: new Date(), error: "" };
+      quotation.status = "sent";
+      quotation.sentAt = new Date();
+    } catch (error) {
+      quotation.emailDelivery = { status: "failed", sentAt: null, error: error.message };
+    }
   }
 
-  const bankEmail = isBankFinancing ? (process.env.BANK_APPLICATION_EMAIL || "") : "";
+  const bankEmail = isBankFinancing && !loanRequest.testRun?.suppressNotifications ? (process.env.BANK_APPLICATION_EMAIL || "") : "";
   quotation.bankDelivery = { status: bankEmail ? "pending" : "not-ready", sentAt: null, error: "" };
   if (bankEmail) {
     try {
@@ -1889,7 +1896,7 @@ app.post("/api/loan-request", async (req, res) => {
 
 app.get("/api/loan-requests", requireAdminAuth, async (req, res) => {
   try {
-    const loanRequests = await LoanRequest.find().sort({ createdAt: -1 });
+    const loanRequests = await LoanRequest.find({ "testRun.isTest": { $ne: true } }).sort({ createdAt: -1 });
 
     return res.json({
       status: true,
@@ -1998,7 +2005,10 @@ app.post("/api/installer/login", async (req, res) => {
 
 app.get("/api/installer/assignments", requireInstallerAuth, async (req, res) => {
   try {
-    const assignments = await LoanRequest.find({ "installerAssignment.installer": req.installer.id })
+    const assignments = await LoanRequest.find({
+      "installerAssignment.installer": req.installer.id,
+      "testRun.isTest": { $ne: true },
+    })
       .sort({ "installerAssignment.assignedAt": -1 })
       .lean();
     return res.json({ status: true, assignments });
@@ -3126,33 +3136,455 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
   }
 });
 
+const operationsTestScenarios = {
+  "builtright-financing": {
+    label: "BuiltRight system · bank financing",
+    paymentMethod: "bank-financing",
+    productSource: "BuiltRight Marketplace",
+    steps: [
+      ["assign-installer", "Assign installer"],
+      ["accept-assignment", "Accept assignment"],
+      ["schedule-inspection", "Schedule inspection and fee"],
+      ["confirm-inspection-payment", "Confirm inspection payment"],
+      ["pass-assessment", "Pass inspection, load audit, and due diligence"],
+      ["generate-quotation", "Generate and send quotation"],
+      ["approve-quotation", "Record customer quotation approval"],
+      ["bank-approved", "Record bank approval and equity"],
+      ["disbursement-confirmed", "Confirm disbursement, order, and invoice"],
+      ["installation-scheduled", "Schedule installation"],
+      ["project-completed", "Complete and commission project"],
+    ],
+  },
+  "external-vendor-financing": {
+    label: "External-vendor system · bank financing",
+    paymentMethod: "bank-financing",
+    productSource: "External Vendor",
+    steps: [
+      ["assign-installer", "Assign BuiltRight installer"],
+      ["accept-assignment", "Accept assignment"],
+      ["schedule-inspection", "Schedule inspection and fee"],
+      ["confirm-inspection-payment", "Confirm inspection payment"],
+      ["pass-assessment", "Verify vendor system and pass all assessments"],
+      ["generate-quotation", "Generate BuiltRight project quotation"],
+      ["approve-quotation", "Record customer quotation approval"],
+      ["bank-approved", "Record bank approval and equity"],
+      ["disbursement-confirmed", "Confirm disbursement, order, and invoice"],
+      ["installation-scheduled", "Schedule BuiltRight installation"],
+      ["project-completed", "Complete and commission project"],
+    ],
+  },
+  "outright-purchase": {
+    label: "BuiltRight system · outright purchase",
+    paymentMethod: "outright",
+    productSource: "BuiltRight Marketplace",
+    steps: [
+      ["assign-installer", "Assign installer"],
+      ["accept-assignment", "Accept assignment"],
+      ["schedule-inspection", "Schedule inspection and fee"],
+      ["confirm-inspection-payment", "Confirm inspection payment"],
+      ["pass-assessment", "Pass inspection, load audit, and due diligence"],
+      ["generate-quotation", "Generate and send final quotation"],
+      ["approve-quotation", "Record customer quotation approval"],
+      ["full-payment-confirmed", "Confirm full payment, order, and invoice"],
+      ["installation-scheduled", "Schedule installation"],
+      ["project-completed", "Complete and commission project"],
+    ],
+  },
+};
+
+const testStepDetails = (loanRequest) => {
+  const scenario = operationsTestScenarios[loanRequest.testRun?.scenario];
+  if (!scenario) return { scenario: null, nextStep: null, progress: 0, completed: true };
+  const currentStep = Math.max(0, Number(loanRequest.testRun?.currentStep || 0));
+  const next = scenario.steps[currentStep];
+  return {
+    scenario,
+    nextStep: next ? { id: next[0], label: next[1] } : null,
+    progress: Math.round(((currentStep + 1) / (scenario.steps.length + 1)) * 100),
+    completed: currentStep >= scenario.steps.length,
+  };
+};
+
+const recordTestStep = (loanRequest, stepId, note) => {
+  loanRequest.testRun.completedSteps.push(stepId);
+  loanRequest.testRun.currentStep += 1;
+  loanRequest.testRun.lastCheckedAt = new Date();
+  loanRequest.statusHistory.push({
+    status: loanRequest.status,
+    source: "operations-test",
+    note,
+  });
+};
+
+const createTestOrderAndInvoice = async (loanRequest) => {
+  const orderReference = `TEST-${loanRequest.testRun.runId}`;
+  let order = await Order.findOne({ reference: orderReference });
+  const quotation = await ProjectDocument.findOne({
+    financingRequest: loanRequest._id,
+    type: "quotation",
+    status: "approved",
+  }).sort({ version: -1 });
+  if (!quotation) throw new Error("An approved quotation is required before creating the test order.");
+
+  if (!order) {
+    order = await Order.create({
+      orderNumber: generateOrderNumber(),
+      reference: orderReference,
+      source: loanRequest.paymentMethod === "outright" ? "Manual" : "Financing",
+      customer: {
+        fullName: loanRequest.customer.fullName,
+        email: loanRequest.customer.email,
+        phone: loanRequest.customer.phone,
+      },
+      items: loanRequest.items,
+      amount: quotation.total,
+      date: new Date().toLocaleDateString("en-GB"),
+      status: "Confirmed",
+      financingRequestId: loanRequest._id,
+    });
+  }
+
+  let invoice = await ProjectDocument.findOne({ financingRequest: loanRequest._id, type: "invoice" });
+  if (!invoice) {
+    invoice = await ProjectDocument.create({
+      reference: `BRI-${loanRequest.testRun.runId}`,
+      financingRequest: loanRequest._id,
+      order: order._id,
+      type: "invoice",
+      version: 1,
+      status: "issued",
+      title: "BuiltRight operations test project invoice",
+      customer: { ...loanRequest.customer },
+      project: quotation.project,
+      lineItems: quotation.lineItems,
+      subtotal: quotation.subtotal,
+      discount: quotation.discount,
+      tax: quotation.tax,
+      total: quotation.total,
+      equityPercentage: quotation.equityPercentage,
+      equityAmount: quotation.equityAmount,
+      bankFinanceAmount: quotation.bankFinanceAmount,
+      terms: "Operations test invoice. No payment is due and no external notification was sent.",
+      notes: `Generated by controlled test run ${loanRequest.testRun.runId}.`,
+      createdBy: loanRequest.testRun.createdBy || "BuiltRight operations test",
+    });
+  }
+  return { order, invoice };
+};
+
+app.get("/api/admin/operations-tests", requireAdminAuth, async (req, res) => {
+  try {
+    const [activeInstallers, products, testRuns] = await Promise.all([
+      User.countDocuments({ role: "installer", isActive: true, "installerProfile.availability": "available" }),
+      Product.countDocuments(),
+      LoanRequest.find({ "testRun.isTest": true }).sort({ createdAt: -1 }).limit(30).lean(),
+    ]);
+
+    const runs = await Promise.all(testRuns.map(async (run) => {
+      const details = testStepDetails(run);
+      const [documents, order] = await Promise.all([
+        ProjectDocument.find({ financingRequest: run._id }).select("type reference status total").sort({ createdAt: -1 }).lean(),
+        Order.findOne({ financingRequestId: run._id }).select("orderNumber status amount").lean(),
+      ]);
+      return {
+        ...run,
+        scenarioLabel: details.scenario?.label || run.testRun?.scenario,
+        nextStep: details.nextStep,
+        progress: details.progress,
+        completed: details.completed,
+        documents,
+        order,
+      };
+    }));
+
+    return res.json({
+      status: true,
+      readiness: {
+        coreReady: activeInstallers > 0 && products > 0,
+        checks: [
+          { id: "database", label: "Operations database", ready: mongoose.connection.readyState === 1, required: true, detail: "MongoDB persistence" },
+          { id: "installers", label: "Active installer", ready: activeInstallers > 0, required: true, detail: `${activeInstallers} available` },
+          { id: "products", label: "Product catalogue", ready: products > 0, required: true, detail: `${products} products` },
+          { id: "email", label: "Email delivery", ready: Boolean(process.env.RESEND_API_KEY || process.env.SMTP_HOST), required: true, detail: "Suppressed during tests" },
+          { id: "bank", label: "Bank API", ready: bankProviderConfigured, required: false, detail: bankProviderConfigured ? "Sandbox configured" : "Manual placeholder" },
+          { id: "ashgridx", label: "AshGridX API", ready: ashGridAdapterReady, required: false, detail: ashGridCredentialsPresent ? "Credentials stored; adapter pending" : "Documentation/credentials pending" },
+        ],
+      },
+      scenarios: Object.entries(operationsTestScenarios).map(([id, item]) => ({ id, label: item.label, stepCount: item.steps.length + 1 })),
+      runs,
+    });
+  } catch (error) {
+    console.error("GET OPERATIONS TESTS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load the operations test centre." });
+  }
+});
+
+app.post("/api/admin/operations-tests", requireAdminAuth, async (req, res) => {
+  try {
+    const scenario = operationsTestScenarios[req.body.scenario];
+    if (!scenario) return res.status(400).json({ status: false, message: "Select a valid test scenario." });
+    const runId = `TST-${Date.now().toString(36).toUpperCase()}`;
+    const external = scenario.productSource === "External Vendor";
+    const financing = scenario.paymentMethod === "bank-financing";
+    const loanRequest = await LoanRequest.create({
+      reference: `BRF-${runId}`,
+      customer: {
+        fullName: `Operations Test Customer ${runId.slice(-4)}`,
+        email: `operations-${runId.toLowerCase()}@example.invalid`,
+        phone: "08000000000",
+        location: "BuiltRight controlled test site, Lagos",
+      },
+      productSource: scenario.productSource,
+      paymentMethod: scenario.paymentMethod,
+      installationProvider: "BuiltRight Services Ltd",
+      financeInstitution: financing ? "RichGreen Microfinance Bank" : "Not applicable — outright payment",
+      vendorName: external ? "Controlled External Vendor" : "",
+      vendorContact: external ? "test-vendor@example.invalid" : "",
+      vendorProductDetails: external ? "10kVA external-vendor hybrid inverter system for technical verification" : "",
+      items: [{
+        id: external ? "test-external-10kva" : "test-builtright-5kva",
+        name: external ? "External Vendor 10kVA Hybrid System" : "BuiltRight 5kVA Hybrid Solar System",
+        quantity: 1,
+        price: external ? null : 4500000,
+        supplier: external ? "Controlled External Vendor" : "BuiltRight Services Ltd",
+        manufacturer: external ? "External Vendor" : "BuiltRight approved supplier",
+        category: "solar-system",
+        type: "Hybrid solar system",
+        capacity: external ? "10kVA" : "5kVA",
+      }],
+      estimatedAmount: external ? null : 4500000,
+      consentToShare: true,
+      thirdPartyNoticeAccepted: external,
+      bankApplication: { provider: financing ? "RichGreen Microfinance Bank" : "", status: financing ? "not-started" : "not-required" },
+      deposit: { percentage: financing ? 20 : 100, status: "not-due" },
+      status: "submitted",
+      statusHistory: [{ status: "submitted", source: "operations-test", note: "Controlled operations test case created; notifications suppressed." }],
+      notes: "Controlled operations test record. No money is due and no external notification should be sent.",
+      testRun: {
+        isTest: true,
+        runId,
+        scenario: req.body.scenario,
+        currentStep: 0,
+        completedSteps: ["intake-created"],
+        suppressNotifications: true,
+        createdBy: req.admin?.email || "BuiltRight admin",
+        lastCheckedAt: new Date(),
+      },
+    });
+    return res.status(201).json({ status: true, message: `${scenario.label} test run created.`, loanRequest });
+  } catch (error) {
+    console.error("CREATE OPERATIONS TEST ERROR:", error.message);
+    return res.status(500).json({ status: false, message: error.message || "Could not create the test run." });
+  }
+});
+
+app.post("/api/admin/operations-tests/:id/next", requireAdminAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "testRun.isTest": true });
+    if (!loanRequest) return res.status(404).json({ status: false, message: "Test run not found." });
+    const details = testStepDetails(loanRequest);
+    if (!details.nextStep) return res.status(409).json({ status: false, message: "This test run is already complete." });
+    const step = details.nextStep.id;
+
+    if (step === "assign-installer") {
+      const installer = await chooseInstaller();
+      if (!installer) return res.status(409).json({ status: false, message: "Create or activate an available installer before running this checkpoint." });
+      loanRequest.installerAssignment = {
+        installer: installer._id,
+        installerName: installer.fullName,
+        installerEmail: installer.email,
+        status: "assigned",
+        assignedAt: new Date(),
+        history: [{ installer: installer._id, installerName: installer.fullName, status: "assigned", note: "Assigned by controlled operations test.", changedAt: new Date() }],
+      };
+      loanRequest.status = "internal-review";
+      recordTestStep(loanRequest, step, `Test assignment allocated to ${installer.fullName}.`);
+    } else if (step === "accept-assignment") {
+      loanRequest.installerAssignment.status = "accepted";
+      loanRequest.installerAssignment.acceptedAt = new Date();
+      loanRequest.installerAssignment.history.push({ installer: loanRequest.installerAssignment.installer, installerName: loanRequest.installerAssignment.installerName, status: "accepted", note: "Test installer accepted assignment.", changedAt: new Date() });
+      recordTestStep(loanRequest, step, "Installer acceptance verified.");
+    } else if (step === "schedule-inspection") {
+      loanRequest.inspection.status = "scheduled";
+      loanRequest.inspection.scheduledAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
+      loanRequest.inspection.assignee = loanRequest.installerAssignment.installerName;
+      loanRequest.inspection.feeAmount = 25000;
+      loanRequest.inspection.feeStatus = "payment-requested";
+      loanRequest.assessment.status = "in-progress";
+      loanRequest.assessment.inspection.status = "scheduled";
+      loanRequest.status = "inspection-scheduled";
+      loanRequest.installerAssignment.status = "scheduled";
+      recordTestStep(loanRequest, step, "Inspection schedule and location-based fee verified.");
+    } else if (step === "confirm-inspection-payment") {
+      loanRequest.inspection.feeStatus = "payment-confirmed";
+      loanRequest.inspection.paymentSubmittedAt = new Date();
+      loanRequest.inspection.paymentConfirmedAt = new Date();
+      loanRequest.inspection.status = "in-progress";
+      loanRequest.status = "under-assessment";
+      recordTestStep(loanRequest, step, "Inspection fee proof and confirmation path verified without real payment.");
+    } else if (step === "pass-assessment") {
+      if (loanRequest.productSource === "External Vendor" && !Number(loanRequest.items?.[0]?.price)) {
+        loanRequest.items[0].price = 6500000;
+        loanRequest.estimatedAmount = 6500000;
+      }
+      loanRequest.inspection.status = "completed";
+      loanRequest.inspection.completedAt = new Date();
+      loanRequest.inspection.propertyType = "Detached duplex";
+      loanRequest.inspection.cableDistance = "28 metres";
+      loanRequest.inspection.mountingMethod = "Pitched-roof aluminium rail";
+      loanRequest.inspection.notes = "Controlled test inspection completed.";
+      loanRequest.inspectionCosts = [
+        { label: "Installation kit and materials", amount: 420000 },
+        { label: "Mounting, cable, DB and protection accessories", amount: 310000 },
+      ];
+      loanRequest.upfrontCosts = [
+        { label: "Standard installation service", amount: 350000, confirmed: true },
+        { label: "IoT tracking", amount: 75000, confirmed: true },
+        { label: "Maintenance", amount: 120000, confirmed: true },
+      ];
+      loanRequest.assessment = {
+        ...loanRequest.assessment.toObject(),
+        status: "passed",
+        inspection: { status: "completed", result: "pass", completedAt: new Date(), completedBy: loanRequest.installerAssignment.installerName, notes: "Test inspection passed." },
+        loadAudit: { ...loanRequest.assessment.loadAudit.toObject(), status: "completed", result: "pass", peakLoadKw: 3.8, dailyEnergyKwh: 16, criticalLoadKw: 2.4, recommendedInverterKva: loanRequest.productSource === "External Vendor" ? 10 : 5, recommendedBatteryKwh: 15, recommendedSolarKw: 6, backupHours: 8, completedAt: new Date(), completedBy: loanRequest.installerAssignment.installerName, notes: "Controlled load audit passed." },
+        dueDiligence: { ...loanRequest.assessment.dueDiligence.toObject(), status: "completed", result: "pass", checklist: [
+          { key: "identity-contact", label: "Customer identity and contact verified", status: "pass" },
+          { key: "property-authority", label: "Property installation authority verified", status: "pass" },
+          { key: "site-access", label: "Site access confirmed", status: "pass" },
+          { key: "technical-suitability", label: "Technical suitability confirmed", status: "pass" },
+          { key: "financing-consent", label: "Data-sharing consent recorded", status: "pass" },
+        ], completedAt: new Date(), completedBy: loanRequest.installerAssignment.installerName, notes: "Controlled due diligence passed." },
+      };
+      loanRequest.installerAssignment.status = "completed";
+      loanRequest.status = "due-diligence-passed";
+      recordTestStep(loanRequest, step, "All three mandatory pre-quotation assessments passed.");
+    } else if (step === "generate-quotation") {
+      const quotation = await autoCreateAndSendQuotation(loanRequest, req.admin?.email || "BuiltRight operations test");
+      loanRequest.status = "quotation-sent";
+      loanRequest.quotation.status = "sent";
+      recordTestStep(loanRequest, step, `Quotation ${quotation.reference} generated; external email suppressed.`);
+    } else if (step === "approve-quotation") {
+      const quotation = await ProjectDocument.findOne({ financingRequest: loanRequest._id, type: "quotation", status: "sent" }).sort({ version: -1 });
+      if (!quotation) throw new Error("A sent test quotation is required before approval.");
+      const approvedAt = new Date();
+      quotation.status = "approved";
+      quotation.customerDecision = { status: "approved", decidedAt: approvedAt, note: "Approved during controlled operations test." };
+      await quotation.save();
+      loanRequest.quotation.status = "approved";
+      loanRequest.quotation.approvedAt = approvedAt;
+      loanRequest.bankApplication.customerApprovedAt = approvedAt;
+      loanRequest.bankApplication.quotationDocument = quotation._id;
+      loanRequest.bankApplication.status = loanRequest.paymentMethod === "outright" ? "not-required" : "ready-for-customer";
+      loanRequest.bankApplication.redirectUrl = loanRequest.paymentMethod === "outright" ? "" : `https://bank-sandbox.example.invalid/apply?reference=${loanRequest.reference}`;
+      loanRequest.status = "quotation-approved";
+      recordTestStep(loanRequest, step, "Customer quotation approval and payment-route unlock verified.");
+    } else if (step === "bank-approved") {
+      loanRequest.bankApplication.status = "approved";
+      loanRequest.bankApplication.externalReference = `BANK-${loanRequest.testRun.runId}`;
+      loanRequest.bankApplication.approvedAmount = Number(loanRequest.finalProjectCost || 0) - Number(loanRequest.deposit.amount || 0);
+      loanRequest.deposit.status = "paid";
+      loanRequest.deposit.paidAt = new Date();
+      loanRequest.status = "awaiting-disbursement";
+      recordTestStep(loanRequest, step, "Bank approval and customer equity checkpoints verified in sandbox mode.");
+    } else if (step === "disbursement-confirmed" || step === "full-payment-confirmed") {
+      if (step === "disbursement-confirmed") {
+        loanRequest.bankApplication.status = "disbursed";
+        loanRequest.bankApplication.disbursedAmount = Number(loanRequest.finalProjectCost || 0) - Number(loanRequest.deposit.amount || 0);
+        loanRequest.bankApplication.disbursedAt = new Date();
+      } else {
+        loanRequest.deposit.status = "paid";
+        loanRequest.deposit.amount = loanRequest.finalProjectCost;
+        loanRequest.deposit.paidAt = new Date();
+      }
+      await createTestOrderAndInvoice(loanRequest);
+      loanRequest.status = "order-created";
+      recordTestStep(loanRequest, step, step === "disbursement-confirmed" ? "Disbursement, confirmed order, and invoice verified." : "Full payment, confirmed order, and invoice verified.");
+    } else if (step === "installation-scheduled") {
+      loanRequest.status = "installation-scheduled";
+      recordTestStep(loanRequest, step, "BuiltRight installation scheduling checkpoint verified.");
+    } else if (step === "project-completed") {
+      loanRequest.status = "completed";
+      const order = await Order.findOne({ financingRequestId: loanRequest._id });
+      if (order) { order.status = "Delivered"; await order.save(); }
+      recordTestStep(loanRequest, step, "Delivery, installation, testing, and commissioning marked complete.");
+    }
+
+    await loanRequest.save();
+    const updatedDetails = testStepDetails(loanRequest);
+    return res.json({
+      status: true,
+      message: `${details.nextStep.label} passed.`,
+      loanRequest,
+      nextStep: updatedDetails.nextStep,
+      progress: updatedDetails.progress,
+      completed: updatedDetails.completed,
+    });
+  } catch (error) {
+    console.error("ADVANCE OPERATIONS TEST ERROR:", error.message);
+    return res.status(500).json({ status: false, message: error.message || "The test checkpoint failed." });
+  }
+});
+
+app.delete("/api/admin/operations-tests/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const testRun = await LoanRequest.findOne({ _id: req.params.id, "testRun.isTest": true });
+    if (!testRun) return res.status(404).json({ status: false, message: "Test run not found." });
+    await Promise.all([
+      ProjectDocument.deleteMany({ financingRequest: testRun._id }),
+      Order.deleteMany({ financingRequestId: testRun._id }),
+      LoanRequest.deleteOne({ _id: testRun._id, "testRun.isTest": true }),
+    ]);
+    return res.json({ status: true, message: `Test run ${testRun.testRun.runId} and its generated test records were removed.` });
+  } catch (error) {
+    console.error("DELETE OPERATIONS TEST ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not remove the test run." });
+  }
+});
+
 /* =========================
    ADMIN DASHBOARD
 ========================= */
 
 app.get("/api/admin/dashboard-stats", requireAdminAuth, async (req, res) => {
   try {
-    const totalProducts = await Product.countDocuments();
-    const totalOrders = await Order.countDocuments();
-    const totalLoanRequests = await LoanRequest.countDocuments();
-    const totalCustomers = await User.countDocuments({ role: "customer" });
-    const pendingLoanRequests = await LoanRequest.countDocuments({
-      status: { $in: ["submitted", "internal-review", "pending", "contacted"] },
+    const productionFilter = { "testRun.isTest": { $ne: true } };
+    const stageGroups = {
+      newRequests: ["submitted", "internal-review", "pending", "contacted"],
+      inspection: ["inspection-scheduled", "inspection-completed"],
+      quotation: ["load-audit-completed", "due-diligence-passed", "quotation-draft", "quotation-sent", "quotation-approved"],
+      bankReview: ["sent-to-bank", "kyc-submitted", "credit-review"],
+      approved: ["approved", "awaiting-deposit", "deposit-paid", "awaiting-disbursement"],
+      disbursed: ["disbursed", "order-created", "installation-scheduled", "installation-in-progress", "completed"],
+    };
+    const [
+      totalProducts,
+      totalOrders,
+      totalLoanRequests,
+      totalCustomers,
+      recentLoanRequests,
+      devices,
+      deviceAlerts,
+      ...stageCounts
+    ] = await Promise.all([
+      Product.countDocuments(),
+      Order.countDocuments(),
+      LoanRequest.countDocuments(productionFilter),
+      User.countDocuments({ role: "customer" }),
+      LoanRequest.find(productionFilter).sort({ updatedAt: -1 }).limit(6).lean(),
+      Device.find().sort({ updatedAt: -1 }).limit(6).lean(),
+      DeviceAlert.find({ status: { $in: ["open", "acknowledged"] } }).sort({ occurredAt: -1 }).limit(8).lean(),
+      ...Object.values(stageGroups).map((statuses) => LoanRequest.countDocuments({ ...productionFilter, status: { $in: statuses } })),
+    ]);
+    const stageSummary = Object.keys(stageGroups).reduce((result, key, index) => ({ ...result, [key]: stageCounts[index] }), {});
+    const pendingLoanRequests = stageSummary.newRequests;
+    const approvedLoans = stageSummary.approved + stageSummary.disbursed;
+    const inspectionsDue = await LoanRequest.countDocuments({
+      ...productionFilter,
+      status: { $in: ["submitted", "internal-review", "inspection-scheduled"] },
     });
-    const approvedLoans = await LoanRequest.countDocuments({
-      status: {
-        $in: [
-          "approved",
-          "awaiting-deposit",
-          "deposit-paid",
-          "awaiting-disbursement",
-          "disbursed",
-          "order-created",
-          "installation-scheduled",
-          "installation-in-progress",
-          "completed",
-        ],
-      },
+    const activeProjects = await LoanRequest.countDocuments({
+      ...productionFilter,
+      status: { $in: ["quotation-approved", "sent-to-bank", "kyc-submitted", "credit-review", "approved", "awaiting-deposit", "deposit-paid", "awaiting-disbursement", "disbursed", "order-created", "installation-scheduled", "installation-in-progress"] },
     });
 
     return res.json({
@@ -3164,7 +3596,14 @@ app.get("/api/admin/dashboard-stats", requireAdminAuth, async (req, res) => {
         totalCustomers,
         pendingLoanRequests,
         approvedLoans,
+        inspectionsDue,
+        activeProjects,
+        openDeviceAlerts: deviceAlerts.length,
       },
+      stageSummary,
+      recentLoanRequests,
+      devices,
+      deviceAlerts,
     });
   } catch (error) {
     console.error("DASHBOARD STATS ERROR:", error.message);
@@ -3231,6 +3670,7 @@ app.get("/api/admin/installers", requireAdminAuth, async (req, res) => {
       activeAssignments: await LoanRequest.countDocuments({
         "installerAssignment.installer": installer._id,
         "installerAssignment.status": { $in: activeInstallerStatuses },
+        "testRun.isTest": { $ne: true },
       }),
     })));
     return res.json({ status: true, installers: installersWithWorkload });
@@ -3247,7 +3687,10 @@ app.get("/api/admin/installers/:id/assignments", requireAdminAuth, async (req, r
       .lean();
     if (!installer) return res.status(404).json({ status: false, message: "Installer not found." });
 
-    const assignments = await LoanRequest.find({ "installerAssignment.installer": installer._id })
+    const assignments = await LoanRequest.find({
+      "installerAssignment.installer": installer._id,
+      "testRun.isTest": { $ne: true },
+    })
       .select("reference customer items productSource paymentMethod status createdAt updatedAt inspection assessment installerAssignment")
       .sort({ updatedAt: -1 })
       .lean();
@@ -3267,6 +3710,7 @@ app.delete("/api/admin/installers/:id", requireAdminAuth, async (req, res) => {
     const activeAssignments = await LoanRequest.countDocuments({
       "installerAssignment.installer": installer._id,
       "installerAssignment.status": { $in: activeInstallerStatuses },
+      "testRun.isTest": { $ne: true },
     });
     if (activeAssignments > 0) {
       return res.status(409).json({

@@ -50,6 +50,21 @@ const loanRequestSchema = new mongoose.Schema(
       trim: true,
     },
 
+    testRun: {
+      isTest: { type: Boolean, default: false, index: true },
+      runId: { type: String, default: "", trim: true, index: true },
+      scenario: {
+        type: String,
+        enum: ["", "builtright-financing", "external-vendor-financing", "outright-purchase"],
+        default: "",
+      },
+      currentStep: { type: Number, default: 0 },
+      completedSteps: { type: [String], default: [] },
+      suppressNotifications: { type: Boolean, default: false },
+      createdBy: { type: String, default: "", trim: true },
+      lastCheckedAt: { type: Date, default: null },
+    },
+
     financeInstitution: {
       type: String,
       default: "Bank partner pending",
