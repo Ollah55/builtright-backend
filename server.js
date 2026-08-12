@@ -3717,6 +3717,43 @@ app.delete("/api/admin/customers/:id", requireAdminAuth, async (req, res) => {
   }
 });
 
+app.post("/api/admin/reset-operational-data", requireAdminAuth, async (req, res) => {
+  try {
+    if (String(req.body.confirmation || "").trim() !== "RESET OPERATIONS") {
+      return res.status(400).json({ status: false, message: "Type RESET OPERATIONS to confirm this irreversible reset." });
+    }
+
+    const [customers, loanRequests, orders, documents, devices, alerts, commands] = await Promise.all([
+      User.countDocuments({ role: "customer" }),
+      LoanRequest.countDocuments(),
+      Order.countDocuments(),
+      ProjectDocument.countDocuments(),
+      Device.countDocuments(),
+      DeviceAlert.countDocuments(),
+      DeviceCommand.countDocuments(),
+    ]);
+
+    await Promise.all([
+      ProjectDocument.deleteMany({}),
+      Order.deleteMany({}),
+      LoanRequest.deleteMany({}),
+      DeviceCommand.deleteMany({}),
+      DeviceAlert.deleteMany({}),
+      Device.deleteMany({}),
+      User.deleteMany({ role: "customer" }),
+    ]);
+
+    return res.json({
+      status: true,
+      message: "Operational data reset complete. Products, installers, and admin accounts were preserved.",
+      deleted: { customers, loanRequests, orders, documents, devices, alerts, commands },
+    });
+  } catch (error) {
+    console.error("RESET OPERATIONAL DATA ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not reset operational data." });
+  }
+});
+
 app.get("/api/admin/installers", requireAdminAuth, async (req, res) => {
   try {
     const installers = await User.find({ role: "installer" }).select("-password -installerProfile.invitationToken").sort({ createdAt: 1 }).lean();
