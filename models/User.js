@@ -50,6 +50,7 @@ const userSchema = new mongoose.Schema(
       invitationExpiresAt: { type: Date, default: null },
       invitedAt: { type: Date, default: null },
       invitationEmailSentAt: { type: Date, default: null },
+      domainLinkReissuedAt: { type: Date, default: null },
       activatedAt: { type: Date, default: null },
     },
   },

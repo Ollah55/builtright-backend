@@ -101,8 +101,10 @@ const sendInstallerInviteEmail = async (user, rawToken) => {
     });
     user.installerProfile.invitationEmailSentAt = new Date();
     await user.save();
+    return true;
   } catch (mailError) {
     console.error("INSTALLER INVITE EMAIL ERROR:", mailError.message);
+    return false;
   }
 };
 
@@ -127,11 +129,30 @@ const makeInstallerInvite = async (installer) => {
   return user;
 };
 
+const reissueInstallerInviteForDomain = async (user) => {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  user.installerProfile.invitationToken = rawToken;
+  user.installerProfile.invitationExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  user.installerProfile.invitedAt = new Date();
+  user.installerProfile.invitationEmailSentAt = null;
+  await user.save();
+  if (await sendInstallerInviteEmail(user, rawToken)) {
+    user.installerProfile.domainLinkReissuedAt = new Date();
+    await user.save();
+  }
+};
+
 const provisionInitialInstallers = async () => {
   for (const installer of initialInstallers) {
     const existing = await User.findOne({ email: installer.email });
     if (!existing) {
       await makeInstallerInvite(installer);
+    } else if (
+      existing.role === "installer" &&
+      !existing.isActive &&
+      !existing.installerProfile?.domainLinkReissuedAt
+    ) {
+      await reissueInstallerInviteForDomain(existing);
     } else if (
       existing.role === "installer" &&
       !existing.isActive &&
