@@ -1936,6 +1936,26 @@ app.delete("/api/loan-requests/:id", requireAdminAuth, async (req, res) => {
   }
 });
 
+app.delete("/api/admin/orders/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).lean();
+    if (!order) return res.status(404).json({ status: false, message: "Order not found." });
+
+    await Promise.all([
+      ProjectDocument.deleteMany({ order: order._id }),
+      Order.deleteOne({ _id: order._id }),
+    ]);
+
+    return res.json({
+      status: true,
+      message: `Order ${order.orderNumber || order.reference} and its linked invoice records were permanently deleted.`,
+    });
+  } catch (error) {
+    console.error("DELETE ORDER ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Failed to permanently delete order." });
+  }
+});
+
 app.get("/api/loan-requests/:id/workspace", requireAdminAuth, async (req, res) => {
   try {
     const loanRequest = await LoanRequest.findById(req.params.id).lean();
@@ -3636,21 +3656,56 @@ app.get("/api/admin/customers", requireAdminAuth, async (req, res) => {
 });
 app.delete("/api/admin/customers/:id", requireAdminAuth, async (req, res) => {
   try {
-    const deletedCustomer = await User.findOneAndDelete({
+    const customer = await User.findOne({
       _id: req.params.id,
       role: "customer",
-    });
+    }).lean();
 
-    if (!deletedCustomer) {
+    if (!customer) {
       return res.status(404).json({
         status: false,
         message: "Customer not found.",
       });
     }
 
+    const customerEmail = String(customer.email || "").toLowerCase();
+    const [loanRequests, devices, orders] = await Promise.all([
+      LoanRequest.find({ "customer.email": customerEmail }).select("_id").lean(),
+      Device.find({
+        $or: [
+          { customer: customer._id },
+          { "customerSnapshot.email": customerEmail },
+        ],
+      }).select("_id").lean(),
+      Order.find({ "customer.email": customerEmail }).select("_id financingRequestId").lean(),
+    ]);
+    const loanRequestIds = loanRequests.map((item) => item._id);
+    const deviceIds = devices.map((item) => item._id);
+    const orderIds = orders.map((item) => item._id);
+
+    await Promise.all([
+      ProjectDocument.deleteMany({
+        $or: [
+          ...(loanRequestIds.length ? [{ financingRequest: { $in: loanRequestIds } }] : []),
+          ...(orderIds.length ? [{ order: { $in: orderIds } }] : []),
+        ],
+      }),
+      Order.deleteMany({
+        $or: [
+          { "customer.email": customerEmail },
+          ...(loanRequestIds.length ? [{ financingRequestId: { $in: loanRequestIds } }] : []),
+        ],
+      }),
+      LoanRequest.deleteMany({ _id: { $in: loanRequestIds } }),
+      DeviceCommand.deleteMany({ device: { $in: deviceIds } }),
+      DeviceAlert.deleteMany({ device: { $in: deviceIds } }),
+      Device.deleteMany({ _id: { $in: deviceIds } }),
+      User.deleteOne({ _id: customer._id, role: "customer" }),
+    ]);
+
     return res.json({
       status: true,
-      message: "Customer deleted successfully.",
+      message: "Customer and all linked financing, order, document, device, alert, and command records were permanently deleted.",
     });
   } catch (error) {
     console.error("DELETE CUSTOMER ERROR:", error.message);
