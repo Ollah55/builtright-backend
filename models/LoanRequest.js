@@ -179,6 +179,14 @@ const loanRequestSchema = new mongoose.Schema(
       notes: { type: String, default: "" },
       feeAmount: { type: Number, default: null },
       feeStatus: { type: String, default: "not-requested" },
+      paymentProof: {
+        url: { type: String, default: "" },
+        publicId: { type: String, default: "" },
+        fileName: { type: String, default: "" },
+        uploadedAt: { type: Date, default: null },
+      },
+      paymentSubmittedAt: { type: Date, default: null },
+      paymentConfirmedAt: { type: Date, default: null },
     },
 
     installerAssignment: {

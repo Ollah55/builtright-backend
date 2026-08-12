@@ -1534,6 +1534,148 @@ const sendSubmissionConfirmationEmail = async (loanRequest) => {
   });
 };
 
+const autoCreateAndSendQuotation = async (loanRequest, createdBy) => {
+  const existingQuotation = await ProjectDocument.findOne({
+    financingRequest: loanRequest._id,
+    type: "quotation",
+    status: { $in: ["draft", "sent", "approved"] },
+  });
+  if (existingQuotation) return existingQuotation;
+
+  const materialLines = (loanRequest.inspectionCosts || [])
+    .filter((item) => String(item?.label || "").trim() && Number(item.amount) > 0)
+    .map((item) => ({
+      category: "installation-materials",
+      description: String(item.label).trim(),
+      quantity: 1,
+      unit: "item",
+      unitPrice: Number(item.amount),
+      amount: Number(item.amount),
+      source: "inspection",
+    }));
+  if (!materialLines.length) {
+    const error = new Error("Add at least one confirmed installation material or work cost before marking the assessment as passed.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const productLines = (loanRequest.items || []).map((item) => {
+    const quantity = Math.max(1, Number(item.quantity || 1));
+    const unitPrice = Math.max(0, Number(item.price || 0));
+    return {
+      category: "solar-system",
+      description: String(item.name || "Selected solar system").trim(),
+      quantity,
+      unit: "system",
+      unitPrice,
+      amount: Math.round(quantity * unitPrice * 100) / 100,
+      source: "confirmed",
+    };
+  }).filter((item) => item.amount > 0);
+  if (!productLines.length && Number(loanRequest.estimatedAmount) > 0) {
+    productLines.push({
+      category: "solar-system",
+      description: "Selected solar system",
+      quantity: 1,
+      unit: "system",
+      unitPrice: Number(loanRequest.estimatedAmount),
+      amount: Number(loanRequest.estimatedAmount),
+      source: "confirmed",
+    });
+  }
+
+  const confirmedLines = (loanRequest.upfrontCosts || [])
+    .filter((item) => String(item?.label || "").trim() && Number(item.amount) > 0)
+    .map((item) => ({
+      category: "other",
+      description: String(item.label).trim(),
+      quantity: 1,
+      unit: "fee",
+      unitPrice: Number(item.amount),
+      amount: Number(item.amount),
+      source: "confirmed",
+    }));
+  const lineItems = [...productLines, ...confirmedLines, ...materialLines];
+  const subtotal = lineItems.reduce((sum, item) => sum + item.amount, 0);
+  if (subtotal <= 0) {
+    const error = new Error("The selected solar system price is required before a final quotation can be generated.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const equityPercentage = Number(loanRequest.deposit?.percentage || 20);
+  const equityAmount = Math.round(subtotal * (equityPercentage / 100) * 100) / 100;
+  const version = (await ProjectDocument.countDocuments({ financingRequest: loanRequest._id, type: "quotation" })) + 1;
+  const firstItem = loanRequest.items?.[0];
+  const quotation = await ProjectDocument.create({
+    reference: `BRQ-${String(loanRequest.reference || loanRequest._id).replace(/^BRF-/, "")}-V${version}`,
+    financingRequest: loanRequest._id,
+    type: "quotation",
+    version,
+    status: "draft",
+    title: `${firstItem?.capacity || "Solar"} project quotation`,
+    customer: { ...loanRequest.customer },
+    project: {
+      systemName: firstItem?.name || "Solar power system",
+      systemCapacity: firstItem?.capacity || "",
+      propertyType: loanRequest.inspection?.propertyType || "",
+      cableDistance: loanRequest.inspection?.cableDistance || "",
+      mountingMethod: loanRequest.inspection?.mountingMethod || "",
+      siteAddress: loanRequest.customer?.location || "",
+      scope: "System supply, site-confirmed installation materials, installation and commissioning.",
+    },
+    lineItems,
+    subtotal,
+    total: subtotal,
+    equityPercentage,
+    equityAmount,
+    bankFinanceAmount: Math.round((subtotal - equityAmount) * 100) / 100,
+    terms: "Quotation is subject to customer approval and bank credit approval. Work begins only after the inspection fee, equity deposit, and bank disbursement are confirmed.",
+    createdBy,
+  });
+
+  const pdf = buildProjectDocumentPdf(quotation);
+  const portalUrl = `${frontendUrl()}/customer/documents`;
+  try {
+    await sendEmail({
+      to: quotation.customer.email,
+      subject: `BuiltRight Project Quotation ${quotation.reference}`,
+      html: `<h2>Your BuiltRight solar project quotation is ready</h2><p>Hello ${safeHtml(quotation.customer.fullName)},</p><p>Your site inspection, load audit, and due-diligence review have passed. Your full project quotation is attached and is now available in your customer profile for download and approval.</p><p><a href="${portalUrl}">Review and accept quotation</a></p>`,
+      attachments: [{ filename: `BuiltRight-Quotation-${quotation.reference}.pdf`, content: pdf, contentType: "application/pdf" }],
+    });
+    quotation.emailDelivery = { status: "sent", sentAt: new Date(), error: "" };
+    quotation.status = "sent";
+    quotation.sentAt = new Date();
+  } catch (error) {
+    quotation.emailDelivery = { status: "failed", sentAt: null, error: error.message };
+  }
+
+  const bankEmail = process.env.BANK_APPLICATION_EMAIL || "";
+  quotation.bankDelivery = { status: bankEmail ? "pending" : "not-ready", sentAt: null, error: "" };
+  if (bankEmail) {
+    try {
+      await sendEmail({
+        to: bankEmail,
+        subject: `BuiltRight quotation for bank application - ${quotation.reference}`,
+        html: `<h2>Solar financing quotation ready for bank application</h2><p><strong>Customer:</strong> ${safeHtml(quotation.customer.fullName)}</p><p><strong>BuiltRight request:</strong> ${safeHtml(loanRequest.reference)}</p><p><strong>Quotation:</strong> ${safeHtml(quotation.reference)}</p><p><strong>Total project cost:</strong> ${formatDocumentMoney(quotation.total)}</p><p>The quotation is attached for the customer's upcoming credit and KYC journey.</p>`,
+        attachments: [{ filename: `BuiltRight-Quotation-${quotation.reference}.pdf`, content: pdf, contentType: "application/pdf" }],
+      });
+      quotation.bankDelivery = { status: "sent", sentAt: new Date(), error: "" };
+    } catch (error) {
+      quotation.bankDelivery = { status: "failed", sentAt: null, error: error.message };
+    }
+  }
+  await quotation.save();
+
+  loanRequest.finalProjectCost = quotation.total;
+  loanRequest.deposit.percentage = equityPercentage;
+  loanRequest.deposit.amount = equityAmount;
+  loanRequest.quotation = { status: quotation.status === "sent" ? "sent" : "draft", document: quotation._id, reference: quotation.reference, version, sentAt: quotation.sentAt, approvedAt: null, changesRequestedAt: null };
+  loanRequest.status = quotation.status === "sent" ? "quotation-sent" : "quotation-draft";
+  loanRequest.statusHistory.push({ status: loanRequest.status, source: "system", note: `Final quotation ${quotation.reference} generated from the passed installer assessment.` });
+  return quotation;
+};
+
 app.post("/api/loan-request", async (req, res) => {
   try {
     const {
@@ -1837,12 +1979,19 @@ app.get("/api/installer/assignments", requireInstallerAuth, async (req, res) => 
 app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (req, res) => {
   try {
     const { scheduledAt, location, inspectionFeeAmount } = req.body;
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    if (!loanRequest || !["assigned", "accepted"].includes(loanRequest.installerAssignment?.status)) {
+      return res.status(404).json({ status: false, message: "This assignment is no longer available for acceptance." });
+    }
+    if (!scheduledAt && !location && !inspectionFeeAmount) {
+      loanRequest.installerAssignment.status = "accepted";
+      loanRequest.installerAssignment.acceptedAt ||= new Date();
+      loanRequest.installerAssignment.history.push({ installer: req.installer.id, installerName: loanRequest.installerAssignment.installerName, status: "accepted", note: "Installer accepted the assignment and will contact the customer before scheduling.", changedAt: new Date() });
+      await loanRequest.save();
+      return res.json({ status: true, message: "Assignment accepted. Contact the customer, then enter the agreed inspection schedule and fee.", loanRequest });
+    }
     if (!scheduledAt || !location || Number(inspectionFeeAmount) <= 0) {
       return res.status(400).json({ status: false, message: "Inspection date, time, location, and a fee amount are required." });
-    }
-    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
-    if (!loanRequest || loanRequest.installerAssignment?.status !== "assigned") {
-      return res.status(404).json({ status: false, message: "This assignment is no longer available for acceptance." });
     }
     const scheduledDate = new Date(scheduledAt);
     if (Number.isNaN(scheduledDate.getTime()) || scheduledDate <= new Date()) {
@@ -1866,7 +2015,7 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
       await sendEmail({
         to: loanRequest.customer.email,
         subject: `BuiltRight inspection scheduled - ${loanRequest.reference}`,
-        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(location)}</li><li><strong>Inspection fee:</strong> ${formatNaira(inspectionFeeAmount)}</li></ul><p>Please make the inspection-fee payment using the details below and keep your proof of payment available for the visit.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul>`,
+        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(location)}</li><li><strong>Inspection fee:</strong> ${formatNaira(inspectionFeeAmount)}</li></ul><p>Please make the inspection-fee payment using the details below. Then sign in to your BuiltRight customer profile, upload your payment proof, and click <strong>I have paid — submit proof</strong>. Your installer can begin the inspection only after confirming receipt.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul><p><a href="${frontendUrl()}/customer/financing">Open customer profile</a></p>`,
       });
     } catch (mailError) {
       console.error("INSPECTION SCHEDULE EMAIL ERROR:", mailError.message);
@@ -1875,6 +2024,29 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
   } catch (error) {
     console.error("ACCEPT INSTALLER ASSIGNMENT ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not accept the inspection assignment." });
+  }
+});
+
+app.patch("/api/installer/assignments/:id/payment-received", requireInstallerAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    if (!loanRequest || !["scheduled", "accepted"].includes(loanRequest.installerAssignment?.status)) {
+      return res.status(404).json({ status: false, message: "This inspection assignment is not available for payment confirmation." });
+    }
+    if (loanRequest.inspection?.feeStatus !== "proof-submitted" || !loanRequest.inspection?.paymentProof?.url) {
+      return res.status(409).json({ status: false, message: "The customer must upload proof of the inspection-fee payment before it can be confirmed." });
+    }
+    loanRequest.inspection.feeStatus = "payment-confirmed";
+    loanRequest.inspection.paymentConfirmedAt = new Date();
+    loanRequest.inspection.status = "in-progress";
+    loanRequest.installerAssignment.status = "accepted";
+    loanRequest.assessment.status = "in-progress";
+    loanRequest.statusHistory.push({ status: "inspection-scheduled", source: "installer", note: `Inspection fee confirmed by ${loanRequest.installerAssignment.installerName}; inspection is now in progress.` });
+    await loanRequest.save();
+    return res.json({ status: true, message: "Inspection payment confirmed. You can now proceed with the site visit and submit the field report.", loanRequest });
+  } catch (error) {
+    console.error("CONFIRM INSPECTION PAYMENT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not confirm the inspection payment." });
   }
 });
 
@@ -1958,8 +2130,12 @@ app.patch("/api/installer/assignments/:id/report", requireInstallerAuth, async (
       loanRequest.status = auditPassed ? "load-audit-completed" : inspectionPassed ? "inspection-completed" : "inspection-scheduled";
     }
     loanRequest.statusHistory.push({ status: loanRequest.status, source: "installer", note: `Inspection, load-audit, due-diligence, and material report updated by ${loanRequest.installerAssignment.installerName}.` });
+    let quotation = null;
+    if (loanRequest.assessment.status === "passed") {
+      quotation = await autoCreateAndSendQuotation(loanRequest, loanRequest.installerAssignment.installerName);
+    }
     await loanRequest.save();
-    return res.json({ status: true, message: loanRequest.assessment.status === "passed" ? "Assessment passed and material costs submitted. The quotation is ready for BuiltRight operations." : "Installer report saved.", loanRequest });
+    return res.json({ status: true, message: quotation?.status === "sent" ? "Assessment passed. The final quotation was emailed to the customer and is available in their profile." : loanRequest.assessment.status === "passed" ? "Assessment passed. The quotation was generated but needs an operations email retry." : "Installer report saved.", loanRequest, quotation });
   } catch (error) {
     console.error("INSTALLER REPORT ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not save the installer report." });
@@ -3064,6 +3240,57 @@ app.get("/api/customer/loan-requests", requireCustomerAuth, async (req, res) => 
     });
   }
 });
+
+app.post(
+  "/api/customer/loan-requests/:id/inspection-payment-proof",
+  requireCustomerAuth,
+  upload.single("proof"),
+  async (req, res) => {
+    try {
+      const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "customer.email": req.user.email });
+      if (!loanRequest) return res.status(404).json({ status: false, message: "Financing request not found." });
+      if (loanRequest.inspection?.feeStatus !== "payment-requested") {
+        return res.status(409).json({ status: false, message: "Inspection payment proof is not currently required for this request." });
+      }
+      if (!req.file || !/^image\/(jpeg|png|webp)$|^application\/pdf$/.test(req.file.mimetype)) {
+        return res.status(400).json({ status: false, message: "Upload a PDF, JPG, PNG, or WEBP payment proof." });
+      }
+      if (req.file.size > 8 * 1024 * 1024) {
+        return res.status(400).json({ status: false, message: "Payment proof must be 8 MB or smaller." });
+      }
+      const result = await cloudinary.uploader.upload(
+        `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`,
+        { folder: "builtright/inspection-payment-proofs", resource_type: "auto" }
+      );
+      loanRequest.inspection.paymentProof = {
+        url: result.secure_url,
+        publicId: result.public_id,
+        fileName: req.file.originalname,
+        uploadedAt: new Date(),
+      };
+      loanRequest.inspection.paymentSubmittedAt = new Date();
+      loanRequest.inspection.feeStatus = "proof-submitted";
+      loanRequest.statusHistory.push({ status: loanRequest.status, source: "customer", note: "Customer uploaded proof of the inspection-fee payment." });
+      await loanRequest.save();
+
+      if (loanRequest.installerAssignment?.installerEmail) {
+        try {
+          await sendEmail({
+            to: loanRequest.installerAssignment.installerEmail,
+            subject: `Inspection payment proof submitted - ${loanRequest.reference}`,
+            html: `<h2>Inspection payment proof submitted</h2><p>${safeHtml(loanRequest.customer.fullName)} has uploaded proof of payment for the inspection fee.</p><p>Sign in to your installer profile to confirm receipt and begin the inspection process.</p><p><a href="${frontendUrl()}/installer/assignments">Open installer profile</a></p>`,
+          });
+        } catch (mailError) {
+          console.error("INSPECTION PROOF NOTIFICATION ERROR:", mailError.message);
+        }
+      }
+      return res.json({ status: true, message: "Payment proof uploaded. Your installer will confirm receipt before beginning the inspection.", loanRequest });
+    } catch (error) {
+      console.error("UPLOAD INSPECTION PAYMENT PROOF ERROR:", error.message);
+      return res.status(500).json({ status: false, message: "Could not upload the inspection payment proof." });
+    }
+  }
+);
 
 app.get("/api/customer/documents", requireCustomerAuth, async (req, res) => {
   try {
