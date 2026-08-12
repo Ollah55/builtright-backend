@@ -38,6 +38,18 @@ const loanRequestSchema = new mongoose.Schema(
       default: "BuiltRight Marketplace",
     },
 
+    paymentMethod: {
+      type: String,
+      enum: ["bank-financing", "outright"],
+      default: "bank-financing",
+    },
+
+    installationProvider: {
+      type: String,
+      default: "BuiltRight Services Ltd",
+      trim: true,
+    },
+
     financeInstitution: {
       type: String,
       default: "Bank partner pending",

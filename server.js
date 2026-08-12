@@ -1548,10 +1548,11 @@ const assignInstallerToLoanRequest = async (loanRequest, { excludedIds = [], rea
 
 const sendSubmissionConfirmationEmail = async (loanRequest) => {
   const installerName = loanRequest.installerAssignment?.installerName || "a BuiltRight installer";
+  const isOutright = loanRequest.paymentMethod === "outright";
   await sendEmail({
     to: loanRequest.customer.email,
-    subject: `BuiltRight financing request received - ${loanRequest.reference}`,
-    html: `<h2>Your financing request was submitted successfully</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>We have received your request ${safeHtml(loanRequest.reference)}. ${safeHtml(installerName)} will contact you shortly to arrange a convenient time for your site inspection.</p><p>After the inspection, load audit, and due diligence, BuiltRight will prepare your final project quotation for approval.</p>`,
+    subject: `BuiltRight ${isOutright ? "outright-purchase" : "financing"} request received - ${loanRequest.reference}`,
+    html: `<h2>Your ${isOutright ? "outright-purchase" : "financing"} request was submitted successfully</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>We have received your request ${safeHtml(loanRequest.reference)}. ${safeHtml(installerName)} will contact you shortly to arrange a convenient time for your site inspection.</p><p>After the inspection, load audit, and due diligence, BuiltRight will prepare your final project quotation for approval.${isOutright ? " Once approved, you will receive a BuiltRight invoice for the full confirmed project cost." : ""}</p>`,
   });
 };
 
@@ -1624,7 +1625,8 @@ const autoCreateAndSendQuotation = async (loanRequest, createdBy) => {
     throw error;
   }
 
-  const equityPercentage = Number(loanRequest.deposit?.percentage || 20);
+  const isBankFinancing = loanRequest.paymentMethod !== "outright";
+  const equityPercentage = isBankFinancing ? Number(loanRequest.deposit?.percentage || 20) : 100;
   const equityAmount = Math.round(subtotal * (equityPercentage / 100) * 100) / 100;
   const version = (await ProjectDocument.countDocuments({ financingRequest: loanRequest._id, type: "quotation" })) + 1;
   const firstItem = loanRequest.items?.[0];
@@ -1650,8 +1652,10 @@ const autoCreateAndSendQuotation = async (loanRequest, createdBy) => {
     total: subtotal,
     equityPercentage,
     equityAmount,
-    bankFinanceAmount: Math.round((subtotal - equityAmount) * 100) / 100,
-    terms: "Quotation is subject to customer approval and bank credit approval. Work begins only after the inspection fee, equity deposit, and bank disbursement are confirmed.",
+    bankFinanceAmount: isBankFinancing ? Math.round((subtotal - equityAmount) * 100) / 100 : 0,
+    terms: isBankFinancing
+      ? "Quotation is subject to customer approval and bank credit approval. Work begins only after the inspection fee, equity deposit, and bank disbursement are confirmed."
+      : "Quotation is subject to customer approval and payment of the final BuiltRight invoice. Work begins only after the inspection fee and full project payment are confirmed.",
     createdBy,
   });
 
@@ -1671,7 +1675,7 @@ const autoCreateAndSendQuotation = async (loanRequest, createdBy) => {
     quotation.emailDelivery = { status: "failed", sentAt: null, error: error.message };
   }
 
-  const bankEmail = process.env.BANK_APPLICATION_EMAIL || "";
+  const bankEmail = isBankFinancing ? (process.env.BANK_APPLICATION_EMAIL || "") : "";
   quotation.bankDelivery = { status: bankEmail ? "pending" : "not-ready", sentAt: null, error: "" };
   if (bankEmail) {
     try {
@@ -1704,6 +1708,7 @@ app.post("/api/loan-request", async (req, res) => {
       items,
       estimatedAmount,
       productSource,
+      paymentMethod,
       financeInstitution,
       interestRate,
       loanTenor,
@@ -1717,9 +1722,11 @@ app.post("/api/loan-request", async (req, res) => {
     } = req.body;
 
     const selectedProductSource = productSource || "BuiltRight Marketplace";
-    const selectedFinanceInstitution =
-      financeInstitution || "Bank partner pending";
-    const equityPercentage = selectedFinanceInstitution === "LOTUS Bank" ? 10 : 20;
+    const selectedPaymentMethod = paymentMethod === "outright" ? "outright" : "bank-financing";
+    const selectedFinanceInstitution = selectedPaymentMethod === "outright"
+      ? "Not applicable — outright payment"
+      : (financeInstitution || "Bank partner pending");
+    const equityPercentage = selectedPaymentMethod === "outright" ? 100 : (selectedFinanceInstitution === "LOTUS Bank" ? 10 : 20);
 
     if (!customer?.fullName || !customer?.email || !customer?.phone) {
       return res.status(400).json({
@@ -1785,6 +1792,8 @@ app.post("/api/loan-request", async (req, res) => {
         location: customer.location || "",
       },
       productSource: selectedProductSource,
+      paymentMethod: selectedPaymentMethod,
+      installationProvider: "BuiltRight Services Ltd",
       financeInstitution: selectedFinanceInstitution,
       interestRate: interestRate || "",
       loanTenor: loanTenor || "",
@@ -1797,7 +1806,7 @@ app.post("/api/loan-request", async (req, res) => {
       consentToShare: Boolean(consentToShare),
       thirdPartyNoticeAccepted: Boolean(thirdPartyNoticeAccepted),
       preferredContact: "WhatsApp",
-      bankApplication: { provider: selectedFinanceInstitution, status: "not-started" },
+      bankApplication: { provider: selectedFinanceInstitution, status: selectedPaymentMethod === "outright" ? "not-required" : "not-started" },
       deposit: { percentage: equityPercentage, status: "not-due" },
       assessment: {
         status: "open",
@@ -1819,7 +1828,7 @@ app.post("/api/loan-request", async (req, res) => {
         {
           status: "submitted",
           source: "customer",
-          note: "Customer submitted a financing request.",
+          note: selectedPaymentMethod === "outright" ? "Customer submitted an outright-purchase project request." : "Customer submitted a financing request.",
         },
       ],
       notes: notes || "",
@@ -1845,13 +1854,15 @@ app.post("/api/loan-request", async (req, res) => {
     try {
       await sendEmail({
         to: process.env.ADMIN_ALERT_EMAIL || process.env.SMTP_USER,
-        subject: `New Financing Request - ${customer.fullName}`,
+        subject: `New ${selectedPaymentMethod === "outright" ? "Outright Purchase" : "Financing"} Request - ${customer.fullName}`,
         html: `
           <h2>New Financing Request</h2>
           <p><strong>Name:</strong> ${customer.fullName}</p>
           <p><strong>Email:</strong> ${customer.email}</p>
           <p><strong>Phone:</strong> ${customer.phone}</p>
           <p><strong>Product Source:</strong> ${selectedProductSource}</p>
+          <p><strong>Payment Route:</strong> ${selectedPaymentMethod === "outright" ? "Outright payment after final quotation" : "Bank financing"}</p>
+          <p><strong>Installation Provider:</strong> BuiltRight Services Ltd</p>
           <p><strong>Finance Institution:</strong> ${selectedFinanceInstitution}</p>
           <p><strong>Assigned installer:</strong> ${safeHtml(loanRequest.installerAssignment?.installerName || "No active installer available")}</p>
           <p><strong>Status:</strong> ${safeHtml(loanRequest.status)}</p>
@@ -2328,9 +2339,12 @@ app.post("/api/loan-requests/:id/quotation", requireAdminAuth, async (req, res) 
     if (total <= 0) {
       return res.status(400).json({ status: false, message: "The final project quotation must have a positive total." });
     }
-    const equityPercentage = 20;
+    const isBankFinancing = loanRequest.paymentMethod !== "outright";
+    const equityPercentage = isBankFinancing
+      ? (loanRequest.financeInstitution === "LOTUS Bank" ? 10 : 20)
+      : 100;
     const equityAmount = Math.round(total * (equityPercentage / 100) * 100) / 100;
-    const bankFinanceAmount = Math.round((total - equityAmount) * 100) / 100;
+    const bankFinanceAmount = isBankFinancing ? Math.round((total - equityAmount) * 100) / 100 : 0;
     const version = (await ProjectDocument.countDocuments({
       financingRequest: loanRequest._id,
       type: "quotation",
@@ -2368,7 +2382,9 @@ app.post("/api/loan-requests/:id/quotation", requireAdminAuth, async (req, res) 
       equityPercentage,
       equityAmount,
       bankFinanceAmount,
-      terms: req.body.terms || "Quotation is subject to customer approval and bank credit approval. Work begins only after the equity deposit and bank disbursement are confirmed.",
+      terms: req.body.terms || (isBankFinancing
+        ? "Quotation is subject to customer approval and bank credit approval. Work begins only after the equity deposit and bank disbursement are confirmed."
+        : "Quotation is subject to customer approval and payment of the final BuiltRight invoice. Work begins only after full project payment is confirmed."),
       notes: req.body.notes || "",
       validUntil: req.body.validUntil || null,
       createdBy: req.admin?.email || "BuiltRight operations",
@@ -3323,7 +3339,7 @@ app.get("/api/customer/documents", requireCustomerAuth, async (req, res) => {
 
     const financingIds = [...new Set(documents.map((document) => String(document.financingRequest)))];
     const financingRequests = await LoanRequest.find({ _id: { $in: financingIds } })
-      .select("reference status quotation bankApplication deposit finalProjectCost")
+      .select("reference status quotation bankApplication deposit finalProjectCost paymentMethod installationProvider productSource")
       .lean();
     const financingById = new Map(financingRequests.map((item) => [String(item._id), item]));
 
@@ -3396,9 +3412,11 @@ app.post("/api/customer/quotations/:id/approve", requireCustomerAuth, async (req
 
     loanRequest.quotation ||= {};
     loanRequest.bankApplication ||= {};
-    const bankApplicationUrl =
-      loanRequest.bankApplication?.redirectUrl || process.env.BANK_APPLICATION_URL || "";
-    const bankApplicationEmail = process.env.BANK_APPLICATION_EMAIL || "";
+    const isOutright = loanRequest.paymentMethod === "outright";
+    const bankApplicationUrl = isOutright
+      ? ""
+      : (loanRequest.bankApplication?.redirectUrl || process.env.BANK_APPLICATION_URL || "");
+    const bankApplicationEmail = isOutright ? "" : (process.env.BANK_APPLICATION_EMAIL || "");
     loanRequest.quotation.status = "approved";
     loanRequest.quotation.document = quotation._id;
     loanRequest.quotation.reference = quotation.reference;
@@ -3406,14 +3424,16 @@ app.post("/api/customer/quotations/:id/approve", requireCustomerAuth, async (req
     loanRequest.bankApplication.redirectUrl = bankApplicationUrl;
     loanRequest.bankApplication.quotationDocument = quotation._id;
     loanRequest.bankApplication.customerApprovedAt = approvedAt;
-    loanRequest.bankApplication.status = bankApplicationUrl
-      ? "ready-for-customer"
-      : "awaiting-bank-link";
+    loanRequest.bankApplication.status = isOutright
+      ? "not-required"
+      : (bankApplicationUrl ? "ready-for-customer" : "awaiting-bank-link");
     loanRequest.status = "quotation-approved";
     loanRequest.statusHistory.push({
       status: "quotation-approved",
       source: "customer",
-      note: `Customer approved quotation ${quotation.reference}.`,
+      note: isOutright
+        ? `Customer approved quotation ${quotation.reference}; final outright-payment invoice is required.`
+        : `Customer approved quotation ${quotation.reference}.`,
     });
 
     if (bankApplicationEmail) {
@@ -3457,9 +3477,11 @@ app.post("/api/customer/quotations/:id/approve", requireCustomerAuth, async (req
 
     return res.json({
       status: true,
-      message: bankApplicationUrl
-        ? "Quotation approved. Your bank credit application is now available."
-        : "Quotation approved. BuiltRight is awaiting the bank's hosted application link.",
+      message: isOutright
+        ? "Quotation approved. BuiltRight will issue your final outright-payment invoice."
+        : (bankApplicationUrl
+          ? "Quotation approved. Your bank credit application is now available."
+          : "Quotation approved. BuiltRight is awaiting the bank's hosted application link."),
       quotation,
       bankApplication: {
         ready: Boolean(bankApplicationUrl),
