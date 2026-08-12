@@ -51,6 +51,7 @@ const userSchema = new mongoose.Schema(
       invitedAt: { type: Date, default: null },
       invitationEmailSentAt: { type: Date, default: null },
       domainLinkReissuedAt: { type: Date, default: null },
+      domainLinkReissueVersion: { type: String, default: "" },
       activatedAt: { type: Date, default: null },
     },
   },

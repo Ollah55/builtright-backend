@@ -138,6 +138,7 @@ const reissueInstallerInviteForDomain = async (user) => {
   await user.save();
   if (await sendInstallerInviteEmail(user, rawToken)) {
     user.installerProfile.domainLinkReissuedAt = new Date();
+    user.installerProfile.domainLinkReissueVersion = "custom-domain-v2";
     await user.save();
   }
 };
@@ -149,7 +150,7 @@ const provisionInitialInstallers = async () => {
       await makeInstallerInvite(installer);
     } else if (
       existing.role === "installer" &&
-      !existing.installerProfile?.domainLinkReissuedAt
+      existing.installerProfile?.domainLinkReissueVersion !== "custom-domain-v2"
     ) {
       await reissueInstallerInviteForDomain(existing);
     } else if (
