@@ -1913,18 +1913,29 @@ app.get("/api/loan-requests", requireAdminAuth, async (req, res) => {
 });
 app.delete("/api/loan-requests/:id", requireAdminAuth, async (req, res) => {
   try {
-    const deletedLoanRequest = await LoanRequest.findByIdAndDelete(req.params.id);
+    const loanRequest = await LoanRequest.findById(req.params.id).lean();
 
-    if (!deletedLoanRequest) {
+    if (!loanRequest) {
       return res.status(404).json({
         status: false,
         message: "Loan request not found.",
       });
     }
 
+    const linkedDevices = await Device.find({ financingRequest: loanRequest._id }).select("_id").lean();
+    const deviceIds = linkedDevices.map((device) => device._id);
+    await Promise.all([
+      ProjectDocument.deleteMany({ financingRequest: loanRequest._id }),
+      Order.deleteMany({ financingRequestId: loanRequest._id }),
+      DeviceCommand.deleteMany({ device: { $in: deviceIds } }),
+      DeviceAlert.deleteMany({ device: { $in: deviceIds } }),
+      Device.deleteMany({ _id: { $in: deviceIds } }),
+      LoanRequest.deleteOne({ _id: loanRequest._id }),
+    ]);
+
     return res.json({
       status: true,
-      message: "Loan request deleted successfully.",
+      message: "Project and all linked quotations, invoices, orders, devices, alerts, and commands were permanently deleted.",
     });
   } catch (error) {
     console.error("DELETE LOAN REQUEST ERROR:", error.message);
