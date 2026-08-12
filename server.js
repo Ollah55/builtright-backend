@@ -3240,6 +3240,49 @@ app.get("/api/admin/installers", requireAdminAuth, async (req, res) => {
   }
 });
 
+app.get("/api/admin/installers/:id/assignments", requireAdminAuth, async (req, res) => {
+  try {
+    const installer = await User.findOne({ _id: req.params.id, role: "installer" })
+      .select("fullName email isActive installerProfile.availability")
+      .lean();
+    if (!installer) return res.status(404).json({ status: false, message: "Installer not found." });
+
+    const assignments = await LoanRequest.find({ "installerAssignment.installer": installer._id })
+      .select("reference customer items productSource paymentMethod status createdAt updatedAt inspection assessment installerAssignment")
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    return res.json({ status: true, installer, assignments });
+  } catch (error) {
+    console.error("GET INSTALLER ASSIGNMENTS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load the installer's workboard." });
+  }
+});
+
+app.delete("/api/admin/installers/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const installer = await User.findOne({ _id: req.params.id, role: "installer" });
+    if (!installer) return res.status(404).json({ status: false, message: "Installer not found." });
+
+    const activeAssignments = await LoanRequest.countDocuments({
+      "installerAssignment.installer": installer._id,
+      "installerAssignment.status": { $in: activeInstallerStatuses },
+    });
+    if (activeAssignments > 0) {
+      return res.status(409).json({
+        status: false,
+        message: `This installer has ${activeAssignments} active assignment${activeAssignments === 1 ? "" : "s"}. Reassign or complete the work before deleting the account.`,
+      });
+    }
+
+    await User.deleteOne({ _id: installer._id });
+    return res.json({ status: true, message: "Installer account deleted successfully." });
+  } catch (error) {
+    console.error("DELETE INSTALLER ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not delete installer." });
+  }
+});
+
 app.post("/api/admin/installers", requireAdminAuth, async (req, res) => {
   try {
     const { fullName, email } = req.body;
