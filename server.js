@@ -149,7 +149,6 @@ const provisionInitialInstallers = async () => {
       await makeInstallerInvite(installer);
     } else if (
       existing.role === "installer" &&
-      !existing.isActive &&
       !existing.installerProfile?.domainLinkReissuedAt
     ) {
       await reissueInstallerInviteForDomain(existing);
