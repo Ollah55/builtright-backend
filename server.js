@@ -321,6 +321,10 @@ const bankProviderConfigured =
   process.env.BANK_PROVIDER_ENABLED === "true" &&
   Boolean(process.env.BANK_PROVIDER_NAME && process.env.BANK_PROVIDER_BASE_URL);
 
+const zoomMeetingSdkConfigured = Boolean(
+  process.env.ZOOM_MEETING_SDK_KEY && process.env.ZOOM_MEETING_SDK_SECRET
+);
+
 // Credentials can be stored now, but outbound AshGridX commands remain closed
 // until the final tamper, acknowledgement, and signature rules are confirmed.
 const ashGridCredentialsPresent = Boolean(
@@ -2123,6 +2127,8 @@ app.get("/api/learner/portal", requireLearnerAuth, async (req, res) => {
         endDate: profile.cohortEnd || null,
         schedule: "Monday–Friday · 10:00–16:00 WAT",
         liveUrl: settings?.liveClassUrl || process.env.TRAINING_LIVE_CLASS_URL || "",
+        meetingSdkReady: Boolean(zoomMeetingSdkConfigured && settings?.meetingNumber),
+        liveSessionActive: Boolean(settings?.liveSessionActive),
         brochureUrl: settings?.brochureUrl || process.env.TRAINING_BROCHURE_URL || "",
         curriculum: [
           { week: "Week 1", title: "Solar and electrical foundations", topics: ["Solar fundamentals", "Electrical safety", "System sizing and components"] },
@@ -2135,6 +2141,60 @@ app.get("/api/learner/portal", requireLearnerAuth, async (req, res) => {
   } catch (error) {
     console.error("LEARNER PORTAL ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not load the training portal." });
+  }
+});
+
+app.post("/api/learner/zoom-signature", requireLearnerAuth, async (req, res) => {
+  try {
+    const learner = await User.findOne({ _id: req.learner.id, role: "learner", isActive: true })
+      .select("fullName email learnerProfile")
+      .lean();
+    if (!learner || learner.learnerProfile?.enrollmentStatus === "suspended") {
+      return res.status(403).json({ status: false, message: "This learner enrolment is not active." });
+    }
+
+    const settings = await TrainingSettings.findOne().lean();
+    if (!settings?.liveSessionActive) {
+      return res.status(403).json({ status: false, message: "The live classroom is not open yet." });
+    }
+    if (!zoomMeetingSdkConfigured) {
+      return res.status(503).json({ status: false, message: "The Zoom classroom has not been connected yet." });
+    }
+
+    const meetingNumber = String(settings.meetingNumber || "").replace(/\D/g, "");
+    if (!meetingNumber) {
+      return res.status(503).json({ status: false, message: "No Zoom meeting has been assigned to this cohort." });
+    }
+
+    const issuedAt = Math.floor(Date.now() / 1000) - 30;
+    const expiresAt = issuedAt + 2 * 60 * 60;
+    const sdkKey = process.env.ZOOM_MEETING_SDK_KEY;
+    const signature = jwt.sign(
+      {
+        sdkKey,
+        appKey: sdkKey,
+        mn: meetingNumber,
+        role: 0,
+        iat: issuedAt,
+        exp: expiresAt,
+        tokenExp: expiresAt,
+      },
+      process.env.ZOOM_MEETING_SDK_SECRET,
+      { algorithm: "HS256", header: { typ: "JWT" } }
+    );
+
+    return res.json({
+      status: true,
+      sdkKey,
+      signature,
+      meetingNumber,
+      passcode: settings.meetingPasscode || "",
+      userName: learner.fullName,
+      userEmail: learner.email,
+    });
+  } catch (error) {
+    console.error("ZOOM SIGNATURE ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not open the Zoom classroom." });
   }
 });
 
@@ -4049,7 +4109,18 @@ app.delete("/api/admin/learners/:id", requireAdminAuth, async (req, res) => {
 app.get("/api/admin/training-settings", requireAdminAuth, async (req, res) => {
   try {
     const settings = await TrainingSettings.findOne().lean();
-    return res.json({ status: true, settings: settings || { cohortName: "BuiltRight Solar Installation Training", liveClassUrl: "", brochureUrl: "" } });
+    return res.json({
+      status: true,
+      settings: {
+        cohortName: settings?.cohortName || "BuiltRight Solar Installation Training",
+        liveClassUrl: settings?.liveClassUrl || "",
+        brochureUrl: settings?.brochureUrl || "",
+        meetingNumber: settings?.meetingNumber || "",
+        meetingPasscode: settings?.meetingPasscode || "",
+        liveSessionActive: Boolean(settings?.liveSessionActive),
+        zoomSdkConfigured: zoomMeetingSdkConfigured,
+      },
+    });
   } catch (error) {
     console.error("GET TRAINING SETTINGS ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not load training settings." });
@@ -4062,9 +4133,16 @@ app.patch("/api/admin/training-settings", requireAdminAuth, async (req, res) => 
       cohortName: String(req.body.cohortName || "BuiltRight Solar Installation Training").trim(),
       liveClassUrl: String(req.body.liveClassUrl || "").trim(),
       brochureUrl: String(req.body.brochureUrl || "").trim(),
+      meetingNumber: String(req.body.meetingNumber || "").replace(/\D/g, ""),
+      meetingPasscode: String(req.body.meetingPasscode || "").trim(),
+      liveSessionActive: req.body.liveSessionActive === true,
     };
     const settings = await TrainingSettings.findOneAndUpdate({}, payload, { new: true, upsert: true, setDefaultsOnInsert: true }).lean();
-    return res.json({ status: true, message: "Training settings saved.", settings });
+    return res.json({
+      status: true,
+      message: "Training settings saved.",
+      settings: { ...settings, zoomSdkConfigured: zoomMeetingSdkConfigured },
+    });
   } catch (error) {
     console.error("UPDATE TRAINING SETTINGS ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not save training settings." });
