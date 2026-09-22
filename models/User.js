@@ -33,7 +33,7 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["customer", "admin", "installer"],
+      enum: ["customer", "admin", "installer", "learner", "accountant"],
       default: "customer",
     },
     isActive: {
@@ -54,9 +54,32 @@ const userSchema = new mongoose.Schema(
       domainLinkReissueVersion: { type: String, default: "" },
       activatedAt: { type: Date, default: null },
     },
+    learnerProfile: {
+      invitationToken: { type: String, default: "" },
+      invitationExpiresAt: { type: Date, default: null },
+      invitedAt: { type: Date, default: null },
+      invitationEmailSentAt: { type: Date, default: null },
+      activatedAt: { type: Date, default: null },
+      cohortName: { type: String, default: "BuiltRight Solar Installation Training" },
+      cohortStart: { type: Date, default: null },
+      cohortEnd: { type: Date, default: null },
+      enrollmentStatus: {
+        type: String,
+        enum: ["invited", "active", "completed", "suspended"],
+        default: "invited",
+      },
+    },
+    accountantProfile: {
+      invitationTokenHash: { type: String, default: "" },
+      invitationExpiresAt: { type: Date, default: null },
+      invitedAt: { type: Date, default: null },
+      activatedAt: { type: Date, default: null },
+    },
   },
   { timestamps: true }
 );
+
+userSchema.index({ role: 1, isActive: 1 }, { unique: true, partialFilterExpression: { role: "accountant", isActive: true } });
 
 const User = mongoose.model("User", userSchema);
 

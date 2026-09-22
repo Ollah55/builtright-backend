@@ -19,6 +19,8 @@ import Device from "./models/Device.js";
 import DeviceAlert from "./models/DeviceAlert.js";
 import DeviceCommand from "./models/DeviceCommand.js";
 import ProjectDocument from "./models/ProjectDocument.js";
+import TrainingSettings from "./models/TrainingSettings.js";
+import { accountingRoutes } from "./accounting/routes.js";
 import sendEmail from "./utils/sendEmail.js";
 
 dotenv.config();
@@ -28,9 +30,113 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 
-// Provider webhook routes keep the raw request body available for future
-// HMAC verification. They remain closed until each provider specification and
-// secret has been configured.
+const getAshGridHeader = (req, name, fallback) =>
+  req.get(name || fallback) || req.get(fallback) || "";
+
+const ashGridWebhookSecret = () => process.env.ASHGRIDX_WEBHOOK_SECRET || "";
+
+const verifyAshGridWebhook = (rawBody, signature, timestamp) => {
+  const secret = ashGridWebhookSecret();
+  if (!secret) return { valid: false, code: "not-configured" };
+  if (!rawBody || !signature) return { valid: false, code: "missing-signature" };
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBody.toString("utf8"));
+  } catch {
+    return { valid: false, code: "invalid-json" };
+  }
+  const effectiveTimestamp = timestamp || parsed.timestamp;
+  if (!effectiveTimestamp) return { valid: false, code: "missing-timestamp" };
+
+  const timestampNumber = Number(effectiveTimestamp);
+  if (!Number.isFinite(timestampNumber)) return { valid: false, code: "invalid-timestamp" };
+  if (Math.abs(Math.floor(Date.now() / 1000) - timestampNumber) > 120) {
+    return { valid: false, code: "stale-timestamp" };
+  }
+
+  // AshGridX signs the exact event/timestamp/data envelope. The raw body is
+  // retained for the audit fingerprint and is never trusted before this check.
+  const signedPayload = JSON.stringify({
+    event: parsed.event,
+    timestamp: String(effectiveTimestamp),
+    data: parsed.data,
+  });
+  const expected = crypto.createHmac("sha256", secret).update(signedPayload).digest("hex");
+  const supplied = String(signature).replace(/^sha256=/i, "").trim();
+  const expectedBuffer = Buffer.from(expected, "utf8");
+  const suppliedBuffer = Buffer.from(supplied, "utf8");
+  const valid = expectedBuffer.length === suppliedBuffer.length && crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
+  return { valid, code: valid ? "ok" : "invalid-signature", parsed, timestamp: timestampNumber };
+};
+
+const ashGridEventDeviceNumber = (payload = {}) =>
+  payload.deviceNumber || payload.deviceId || payload.customerDeviceId || payload.data?.deviceNumber || payload.data?.deviceId || payload.data?.customerDeviceId;
+
+const processAshGridXEvent = async ({ payload, rawBody, source = "provider-webhook" }) => {
+  const eventName = String(payload.event || payload.type || payload.data?.event || "UNKNOWN").toUpperCase();
+  const data = payload.data && typeof payload.data === "object" ? payload.data : payload;
+  const identifier = ashGridEventDeviceNumber(data) || ashGridEventDeviceNumber(payload);
+  const fingerprint = `ashgridx-${crypto.createHash("sha256").update(rawBody || JSON.stringify(payload)).digest("hex")}`;
+  const duplicate = await DeviceAlert.findOne({ providerEventId: fingerprint });
+  if (duplicate) return { duplicate: true, alert: duplicate };
+
+  const device = await resolveDevice(identifier);
+  if (!device) return { ignored: true, reason: "device-not-registered", identifier, eventName };
+
+  const isTamper = ["BYPASS", "TAMPER", "CABLE_DISCONNECTED", "PROTECTION_BYPASS"].includes(eventName);
+  const isRestored = ["TAMPER_RESTORED", "PROTECTION_RESTORED", "NORMAL", "CLEAR"].includes(eventName);
+  const isOffline = ["DEVICE_OFFLINE", "DISCONNECTED"].includes(eventName);
+  const occurredAt = payload.timestamp ? new Date(Number(payload.timestamp) * 1000) : new Date();
+
+  if (isTamper) {
+    device.tamper = {
+      status: "confirmed",
+      eventType: "BYPASS",
+      detectedAt: occurredAt,
+      acknowledgedAt: null,
+      notes: "AshGridX reported a protection bypass/cable disconnection.",
+    };
+    device.inverterState = "off";
+  } else if (isRestored) {
+    device.tamper = {
+      status: "clear",
+      eventType: eventName,
+      detectedAt: device.tamper?.detectedAt || null,
+      acknowledgedAt: device.tamper?.acknowledgedAt || null,
+      notes: "AshGridX reported that the protection condition has cleared.",
+    };
+  }
+  if (isOffline) device.connectivity = "offline";
+  if (["DEVICE_ONLINE", "CONNECTED", "CONNECTIVITY_RESTORED"].includes(eventName)) {
+    device.connectivity = "online";
+    device.lastSeenAt = occurredAt;
+  }
+  device.lastProviderSyncAt = new Date();
+  await device.save();
+
+  const alert = await DeviceAlert.create({
+    reference: generateOperationsReference("BRALT"),
+    device: device._id,
+    deviceReference: device.reference,
+    providerEventId: fingerprint,
+    type: isTamper ? "cable-disconnected" : isOffline ? "offline" : isRestored ? "connectivity-restored" : "other",
+    severity: isTamper ? "critical" : isOffline ? "warning" : "info",
+    status: "open",
+    source,
+    occurredAt,
+    title: isTamper ? "AshGridX BYPASS / tamper detected" : `AshGridX ${eventName.toLowerCase().replaceAll("_", " ")}`,
+    detail: isTamper
+      ? "The inverter protection circuit reported a cable disconnection. The device should be investigated at the assigned site."
+      : String(data.reason || data.message || "Provider event received and recorded."),
+    evidence: { event: eventName, deviceNumber: identifier, payload },
+  });
+  return { alert, device, eventName };
+};
+
+// Provider webhook routes keep the raw request body available for HMAC
+// verification. They return a clear configuration response until a secret is
+// supplied, while fully processing signed pilot events once enabled.
 app.post(
   "/api/webhooks/bank/:provider",
   express.raw({ type: "application/json" }),
@@ -45,12 +151,29 @@ app.post(
 app.post(
   "/api/webhooks/ashgridx",
   express.raw({ type: "application/json" }),
-  (req, res) =>
-    res.status(503).json({
-      status: false,
-      code: "ASHGRIDX_NOT_CONFIGURED",
-      message: "AshGridX webhook processing is not configured.",
-    })
+  async (req, res) => {
+    const signatureHeader = process.env.ASHGRIDX_WEBHOOK_SIGNATURE_HEADER || "x-ashgridx-signature";
+    const timestampHeader = process.env.ASHGRIDX_WEBHOOK_TIMESTAMP_HEADER || "x-ashgridx-timestamp";
+    const signature = getAshGridHeader(req, signatureHeader, "x-ashgridx-signature")
+      || req.get("x-signature")
+      || req.get("x-webhook-signature");
+    const timestamp = getAshGridHeader(req, timestampHeader, "x-ashgridx-timestamp")
+      || req.get("x-timestamp");
+    const verification = verifyAshGridWebhook(req.body, signature, timestamp);
+    if (verification.code === "not-configured") {
+      return res.status(503).json({ status: false, code: "ASHGRIDX_WEBHOOK_NOT_CONFIGURED", message: "AshGridX webhook secret is not configured." });
+    }
+    if (!verification.valid) {
+      return res.status(401).json({ status: false, code: `ASHGRIDX_WEBHOOK_${verification.code.toUpperCase()}`, message: "AshGridX webhook signature could not be verified." });
+    }
+    try {
+      const result = await processAshGridXEvent({ payload: verification.parsed, rawBody: req.body });
+      return res.status(200).json({ status: true, received: true, ...result });
+    } catch (error) {
+      console.error("AshGridX webhook processing error:", error);
+      return res.status(500).json({ status: false, message: "AshGridX event could not be recorded." });
+    }
+  }
 );
 
 app.use(express.json());
@@ -126,6 +249,47 @@ const makeInstallerInvite = async (installer) => {
     },
   });
   await sendInstallerInviteEmail(user, rawToken);
+  return user;
+};
+
+const sendLearnerInviteEmail = async (user, rawToken) => {
+  const activationUrl = `${frontendUrl()}/learner/activate?token=${rawToken}`;
+  try {
+    await sendEmail({
+      to: user.email,
+      subject: "Welcome to BuiltRight Solar Installation Training",
+      html: `<h2>Welcome to BuiltRight Solar Installation Training</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your learner account has been created for the active virtual training cohort. Set a secure password to access your curriculum, training brochure, live class link, and session resources.</p><p><a href="${activationUrl}">Set your learner password</a></p><p>This secure invitation expires in 7 days.</p>`,
+    });
+    user.learnerProfile.invitationEmailSentAt = new Date();
+    await user.save();
+    return true;
+  } catch (mailError) {
+    console.error("LEARNER INVITE EMAIL ERROR:", mailError.message);
+    return false;
+  }
+};
+
+const makeLearnerInvite = async (learner) => {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const temporaryPassword = crypto.randomBytes(24).toString("base64url");
+  const user = await User.create({
+    fullName: learner.fullName,
+    email: learner.email,
+    phone: learner.phone || "",
+    password: await bcrypt.hash(temporaryPassword, 10),
+    role: "learner",
+    isActive: false,
+    learnerProfile: {
+      invitationToken: rawToken,
+      invitationExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      invitedAt: new Date(),
+      cohortName: learner.cohortName || "BuiltRight Solar Installation Training",
+      cohortStart: learner.cohortStart || null,
+      cohortEnd: learner.cohortEnd || null,
+      enrollmentStatus: "invited",
+    },
+  });
+  await sendLearnerInviteEmail(user, rawToken);
   return user;
 };
 
@@ -232,6 +396,8 @@ const requireCustomerAuth = (req, res, next) => {
   }
 };
 
+app.use("/api", accountingRoutes(requireAdminAuth));
+
 const requireInstallerAuth = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -243,6 +409,23 @@ const requireInstallerAuth = (req, res, next) => {
       return res.status(403).json({ status: false, message: "Installer access required." });
     }
     req.installer = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ status: false, message: "Invalid or expired token." });
+  }
+};
+
+const requireLearnerAuth = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ status: false, message: "Unauthorized" });
+    }
+    const decoded = jwt.verify(authHeader.split(" ")[1], process.env.JWT_SECRET);
+    if (decoded.role !== "learner") {
+      return res.status(403).json({ status: false, message: "Learner access required." });
+    }
+    req.learner = decoded;
     next();
   } catch (error) {
     return res.status(401).json({ status: false, message: "Invalid or expired token." });
@@ -262,12 +445,14 @@ const bankProviderConfigured =
   process.env.BANK_PROVIDER_ENABLED === "true" &&
   Boolean(process.env.BANK_PROVIDER_NAME && process.env.BANK_PROVIDER_BASE_URL);
 
-// Credentials can be stored now, but outbound AshGridX commands remain closed
-// until the final tamper, acknowledgement, and signature rules are confirmed.
+// Credentials can be stored now, but outbound commands remain closed unless
+// the pilot is explicitly enabled. This prevents a staging key from reaching
+// a live inverter by accident.
 const ashGridCredentialsPresent = Boolean(
   process.env.ASHGRIDX_API_BASE_URL && process.env.ASHGRIDX_API_KEY
 );
-const ashGridAdapterReady = false;
+const ashGridWebhookConfigured = Boolean(process.env.ASHGRIDX_WEBHOOK_SECRET);
+const ashGridAdapterReady = process.env.ASHGRIDX_ENABLED === "true" && ashGridCredentialsPresent && ashGridWebhookConfigured;
 
 app.get("/api/integrations/status", requireAdminAuth, (req, res) => {
   res.json({
@@ -280,7 +465,8 @@ app.get("/api/integrations/status", requireAdminAuth, (req, res) => {
       ashGridX: {
         configured: ashGridAdapterReady,
         credentialsPresent: ashGridCredentialsPresent,
-        mode: "sandbox-placeholder",
+        webhookConfigured: ashGridWebhookConfigured,
+        mode: ashGridAdapterReady ? "sandbox" : "pilot-placeholder",
       },
     },
   });
@@ -313,6 +499,8 @@ async function resolveDevice(identifier) {
   return Device.findOne({
     $or: [
       { reference: String(identifier).toUpperCase() },
+      { deviceNumber: String(identifier).toUpperCase() },
+      { customerDeviceId: String(identifier) },
       { providerDeviceId: String(identifier) },
     ],
   });
@@ -454,6 +642,8 @@ app.get("/api/admin/devices", requireAdminAuth, async (req, res) => {
       const search = new RegExp(escapeSearchText(req.query.search), "i");
       query.$or = [
         { reference: search },
+        { deviceNumber: search },
+        { customerDeviceId: search },
         { providerDeviceId: search },
         { serialNumber: search },
         { projectReference: search },
@@ -475,6 +665,7 @@ app.post("/api/admin/devices", requireAdminAuth, async (req, res) => {
     const {
       reference,
       providerDeviceId,
+      customerDeviceId,
       serialNumber,
       label,
       customerId,
@@ -506,7 +697,9 @@ app.post("/api/admin/devices", requireAdminAuth, async (req, res) => {
 
     const device = await Device.create({
       reference,
+      deviceNumber: String(reference).toUpperCase(),
       providerDeviceId: providerDeviceId || undefined,
+      customerDeviceId: customerDeviceId || undefined,
       serialNumber,
       label,
       customer: customer?._id || null,
@@ -547,6 +740,10 @@ app.patch("/api/admin/devices/:id", requireAdminAuth, async (req, res) => {
 
     const allowedFields = [
       "providerDeviceId",
+      "customerDeviceId",
+      "deviceNumber",
+      "providerSiteId",
+      "providerOwnerId",
       "serialNumber",
       "label",
       "customerSnapshot",
@@ -564,6 +761,9 @@ app.patch("/api/admin/devices/:id", requireAdminAuth, async (req, res) => {
       "gracePeriod",
       "installedAt",
       "metadata",
+      "lastProviderSyncAt",
+      "lastCommandStatus",
+      "lastCommandReference",
     ];
 
     allowedFields.forEach((field) => {
@@ -601,6 +801,53 @@ app.patch("/api/admin/devices/:id", requireAdminAuth, async (req, res) => {
 });
 
 app.post("/api/admin/devices/:id/control", requireAdminAuth, handleDeviceControl);
+
+app.get("/api/admin/devices/:id/status", requireAdminAuth, async (req, res) => {
+  try {
+    const device = await resolveDevice(req.params.id);
+    if (!device) return res.status(404).json({ status: false, message: "Device not found." });
+    const [alerts, commands] = await Promise.all([
+      DeviceAlert.find({ device: device._id }).sort({ occurredAt: -1 }).limit(25).lean(),
+      DeviceCommand.find({ device: device._id }).sort({ createdAt: -1 }).limit(25).lean(),
+    ]);
+    return res.json({
+      status: true,
+      provider: "AshGridX",
+      liveStateQuerySupported: ashGridAdapterReady,
+      device,
+      alerts,
+      commands,
+    });
+  } catch (error) {
+    console.error("Fetch device status error:", error);
+    return res.status(500).json({ status: false, message: "Could not load device status." });
+  }
+});
+
+// Admin-only test hook: it exercises the exact persistence path used by a
+// signed AshGridX webhook without contacting the provider or changing a real
+// inverter. This keeps the pilot fully testable before credentials arrive.
+app.post("/api/admin/devices/:id/simulate-event", requireAdminAuth, async (req, res) => {
+  try {
+    const device = await resolveDevice(req.params.id);
+    if (!device) return res.status(404).json({ status: false, message: "Device not found." });
+    const event = String(req.body.event || "BYPASS").toUpperCase();
+    const allowedEvents = ["BYPASS", "TAMPER_RESTORED", "DEVICE_OFFLINE", "DEVICE_ONLINE", "CONNECTED"];
+    if (!allowedEvents.includes(event)) {
+      return res.status(400).json({ status: false, message: `Test event must be one of: ${allowedEvents.join(", ")}.` });
+    }
+    const payload = {
+      event,
+      timestamp: String(Math.floor(Date.now() / 1000)),
+      data: { deviceNumber: device.deviceNumber || device.reference, source: "BuiltRight test centre" },
+    };
+    const result = await processAshGridXEvent({ payload, rawBody: JSON.stringify(payload), source: "manual" });
+    return res.json({ status: true, simulated: true, ...result });
+  } catch (error) {
+    console.error("Simulate AshGridX event error:", error);
+    return res.status(500).json({ status: false, message: "Could not simulate provider event." });
+  }
+});
 
 app.get("/api/admin/device-alerts", requireAdminAuth, async (req, res) => {
   try {
@@ -1987,6 +2234,97 @@ app.get("/api/loan-requests/:id/workspace", requireAdminAuth, async (req, res) =
 /* =========================
    INSTALLER AUTH
 ========================= */
+
+/* =========================
+   LEARNER AUTH
+========================= */
+
+app.post("/api/learner/activate", async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password || password.length < 8) {
+      return res.status(400).json({ status: false, message: "A valid invitation token and an 8-character password are required." });
+    }
+    const learner = await User.findOne({
+      role: "learner",
+      "learnerProfile.invitationToken": token,
+      "learnerProfile.invitationExpiresAt": { $gt: new Date() },
+    });
+    if (!learner) {
+      return res.status(400).json({ status: false, message: "This learner invitation is invalid or has expired." });
+    }
+    learner.password = await bcrypt.hash(password, 10);
+    learner.isActive = true;
+    learner.learnerProfile.invitationToken = "";
+    learner.learnerProfile.invitationExpiresAt = null;
+    learner.learnerProfile.activatedAt = new Date();
+    learner.learnerProfile.enrollmentStatus = "active";
+    await learner.save();
+    return res.json({ status: true, message: "Learner account activated. You can now sign in." });
+  } catch (error) {
+    console.error("LEARNER ACTIVATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Learner account could not be activated." });
+  }
+});
+
+app.post("/api/learner/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const learner = await User.findOne({ email: String(email || "").toLowerCase(), role: "learner" });
+    if (!learner || !learner.isActive || !(await bcrypt.compare(password || "", learner.password))) {
+      return res.status(401).json({ status: false, message: "Invalid learner credentials." });
+    }
+    const token = createToken({ id: learner._id, email: learner.email, role: "learner" });
+    return res.json({
+      status: true,
+      token,
+      user: { id: learner._id, fullName: learner.fullName, email: learner.email, phone: learner.phone, role: learner.role },
+    });
+  } catch (error) {
+    console.error("LEARNER LOGIN ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Learner login failed." });
+  }
+});
+
+app.get("/api/learner/portal", requireLearnerAuth, async (req, res) => {
+  try {
+    const learner = await User.findOne({ _id: req.learner.id, role: "learner" })
+      .select("fullName email phone learnerProfile")
+      .lean();
+    if (!learner || learner.learnerProfile?.enrollmentStatus === "suspended") {
+      return res.status(403).json({ status: false, message: "This learner enrolment is not active." });
+    }
+    const profile = learner.learnerProfile || {};
+    const settings = await TrainingSettings.findOne().lean();
+    return res.json({
+      status: true,
+      learner: {
+        id: learner._id,
+        fullName: learner.fullName,
+        email: learner.email,
+        phone: learner.phone,
+        enrollmentStatus: profile.enrollmentStatus || "active",
+      },
+      cohort: {
+        name: settings?.cohortName || profile.cohortName || "BuiltRight Solar Installation Training",
+        startDate: profile.cohortStart || null,
+        endDate: profile.cohortEnd || null,
+        schedule: "Monday–Friday · 10:00–16:00 WAT",
+        liveUrl: settings?.liveClassUrl || process.env.TRAINING_LIVE_CLASS_URL || "",
+        brochureUrl: settings?.brochureUrl || process.env.TRAINING_BROCHURE_URL || "",
+        curriculum: [
+          { week: "Week 1", title: "Solar and electrical foundations", topics: ["Solar fundamentals", "Electrical safety", "System sizing and components"] },
+          { week: "Week 2", title: "Installation practice", topics: ["Mounting and wiring", "Inverter and battery setup", "Protection and changeover systems"] },
+          { week: "Week 3", title: "Testing and commissioning", topics: ["Load audit", "Testing and fault finding", "Commissioning documentation"] },
+          { week: "Week 4", title: "Maintenance and field delivery", topics: ["Preventive maintenance", "Customer handover", "Business and project best practice"] },
+        ],
+      },
+    });
+  } catch (error) {
+    console.error("LEARNER PORTAL ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load the training portal." });
+  }
+});
 
 app.post("/api/installer/activate", async (req, res) => {
   try {
@@ -3841,6 +4179,86 @@ app.post("/api/admin/installers", requireAdminAuth, async (req, res) => {
   } catch (error) {
     console.error("CREATE INSTALLER ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not create installer." });
+  }
+});
+
+app.get("/api/admin/learners", requireAdminAuth, async (req, res) => {
+  try {
+    const learners = await User.find({ role: "learner" })
+      .select("fullName email phone isActive createdAt learnerProfile")
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({
+      status: true,
+      learners: learners.map((learner) => ({
+        ...learner,
+        learnerProfile: learner.learnerProfile ? {
+          ...learner.learnerProfile,
+          invitationToken: undefined,
+        } : learner.learnerProfile,
+      })),
+    });
+  } catch (error) {
+    console.error("GET LEARNERS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load learners." });
+  }
+});
+
+app.post("/api/admin/learners", requireAdminAuth, async (req, res) => {
+  try {
+    const fullName = String(req.body.fullName || "").trim();
+    const email = String(req.body.email || "").toLowerCase().trim();
+    const phone = String(req.body.phone || "").trim();
+    if (!fullName || !email || !phone) {
+      return res.status(400).json({ status: false, message: "Learner name, phone number, and email are required." });
+    }
+    const existing = await User.findOne({ email });
+    if (existing) return res.status(409).json({ status: false, message: "An account already uses this email address." });
+    const learner = await makeLearnerInvite({ fullName, email, phone });
+    return res.status(201).json({
+      status: true,
+      message: "Learner added and invitation email sent.",
+      learner: { id: learner._id, fullName: learner.fullName, email: learner.email, phone: learner.phone },
+    });
+  } catch (error) {
+    console.error("CREATE LEARNER ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not add learner." });
+  }
+});
+
+app.delete("/api/admin/learners/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const learner = await User.findOneAndDelete({ _id: req.params.id, role: "learner" });
+    if (!learner) return res.status(404).json({ status: false, message: "Learner not found." });
+    return res.json({ status: true, message: "Learner account deleted successfully." });
+  } catch (error) {
+    console.error("DELETE LEARNER ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not delete learner." });
+  }
+});
+
+app.get("/api/admin/training-settings", requireAdminAuth, async (req, res) => {
+  try {
+    const settings = await TrainingSettings.findOne().lean();
+    return res.json({ status: true, settings: settings || { cohortName: "BuiltRight Solar Installation Training", liveClassUrl: "", brochureUrl: "" } });
+  } catch (error) {
+    console.error("GET TRAINING SETTINGS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load training settings." });
+  }
+});
+
+app.patch("/api/admin/training-settings", requireAdminAuth, async (req, res) => {
+  try {
+    const payload = {
+      cohortName: String(req.body.cohortName || "BuiltRight Solar Installation Training").trim(),
+      liveClassUrl: String(req.body.liveClassUrl || "").trim(),
+      brochureUrl: String(req.body.brochureUrl || "").trim(),
+    };
+    const settings = await TrainingSettings.findOneAndUpdate({}, payload, { new: true, upsert: true, setDefaultsOnInsert: true }).lean();
+    return res.json({ status: true, message: "Training settings saved.", settings });
+  } catch (error) {
+    console.error("UPDATE TRAINING SETTINGS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not save training settings." });
   }
 });
 

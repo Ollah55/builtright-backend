@@ -19,7 +19,7 @@ const deviceCommandSchema = new mongoose.Schema(
     action: { type: String, enum: ["on", "off"], required: true },
     status: {
       type: String,
-      enum: ["blocked", "pending", "sent", "acknowledged", "failed", "cancelled"],
+      enum: ["blocked", "pending", "accepted", "sent", "acknowledged", "executed", "failed", "timed-out", "offline", "cancelled"],
       default: "pending",
       index: true,
     },
@@ -30,6 +30,8 @@ const deviceCommandSchema = new mongoose.Schema(
     reason: { type: String, required: true, trim: true },
     provider: { type: String, default: "AshGridX", trim: true },
     providerReference: { type: String, default: "", trim: true },
+    providerState: { type: String, default: "", trim: true },
+    dedupeKey: { type: String, default: "", trim: true },
     policySnapshot: {
       paymentStanding: { type: String, default: "unknown" },
       gracePeriodEndsAt: { type: Date, default: null },
@@ -41,6 +43,7 @@ const deviceCommandSchema = new mongoose.Schema(
     blockedReason: { type: String, default: "", trim: true },
     sentAt: { type: Date, default: null },
     acknowledgedAt: { type: Date, default: null },
+    executedAt: { type: Date, default: null },
     failureCode: { type: String, default: "", trim: true },
     failureMessage: { type: String, default: "", trim: true },
   },

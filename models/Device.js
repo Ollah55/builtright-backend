@@ -28,6 +28,13 @@ const deviceSchema = new mongoose.Schema(
       trim: true,
       index: { unique: true, sparse: true },
     },
+    // AshGridX generates customerDeviceId during onboarding. BuiltRight uses
+    // deviceNumber as the deterministic human-facing identifier in every
+    // webhook, audit record, and support conversation.
+    customerDeviceId: { type: String, trim: true, index: true },
+    deviceNumber: { type: String, trim: true, index: true },
+    providerSiteId: { type: String, trim: true, default: "" },
+    providerOwnerId: { type: String, trim: true, default: "" },
     serialNumber: { type: String, default: "", trim: true },
     label: { type: String, default: "Financed solar asset", trim: true },
 
@@ -76,6 +83,8 @@ const deviceSchema = new mongoose.Schema(
     },
     lastSeenAt: { type: Date, default: null },
     lastProviderSyncAt: { type: Date, default: null },
+    lastCommandStatus: { type: String, default: "", trim: true },
+    lastCommandReference: { type: String, default: "", trim: true },
 
     tamper: {
       status: {

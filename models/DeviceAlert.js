@@ -60,6 +60,7 @@ const deviceAlertSchema = new mongoose.Schema(
 );
 
 deviceAlertSchema.index({ device: 1, occurredAt: -1 });
+deviceAlertSchema.index({ providerEventId: 1 });
 
 const DeviceAlert = mongoose.model("DeviceAlert", deviceAlertSchema);
 
