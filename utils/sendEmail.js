@@ -47,9 +47,6 @@ const sendWithSmtp = async ({ to, subject, html, cc, bcc, attachments = [] }) =>
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,
     },
-    tls: {
-      rejectUnauthorized: false,
-    },
     family: 4,
     connectionTimeout: 30000,
     greetingTimeout: 30000,
