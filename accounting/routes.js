@@ -5,6 +5,7 @@ import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import User from "../models/User.js";
 import AccountingAccount from "../models/AccountingAccount.js";
+import AccountingAsset from "../models/AccountingAsset.js";
 import AccountingJournal from "../models/AccountingJournal.js";
 import sendEmail from "../utils/sendEmail.js";
 import { accountBalances, balanceSheet, generalLedger, normalSideForType, parseNairaToKobo, profitAndLoss, trialBalance, validateJournalLines } from "./accountingMath.js";
@@ -16,6 +17,17 @@ const validDay = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.t
 const dateAt = (day) => new Date(`${day}T12:00:00.000Z`);
 const tokenHash = (raw) => crypto.createHash("sha256").update(raw).digest("hex");
 const clean = (value, max = 200) => String(value || "").trim().slice(0, max);
+const nullableDay = (value) => {
+  if (value === null || value === undefined || value === "") return null;
+  if (!validDay(value)) throw new Error("Enter a valid acquisition date.");
+  return dateAt(value);
+};
+const optionalInteger = (value, label, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) => {
+  if (value === null || value === undefined || value === "") return null;
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result < minimum || result > maximum) throw new Error(`${label} is invalid.`);
+  return result;
+};
 const userView = (user) => ({ id: user._id, fullName: user.fullName, email: user.email, isActive: user.isActive, invitedAt: user.accountantProfile?.invitedAt, invitationExpiresAt: user.accountantProfile?.invitationExpiresAt, activatedAt: user.accountantProfile?.activatedAt });
 
 export function accountingRoutes(requireAdminAuth) {
@@ -137,6 +149,79 @@ export function accountingRoutes(requireAdminAuth) {
       await account.save();
       res.json({ status: true, account });
     } catch { res.status(500).json({ status: false, message: "Could not update account." }); }
+  });
+
+  router.get("/accounting/assets", accountantAuth, async (_req, res) => {
+    try {
+      const assets = await AccountingAsset.find().sort({ assetCode: 1 }).lean();
+      res.json({ status: true, assets });
+    } catch {
+      res.status(500).json({ status: false, message: "Could not load the fixed-asset register." });
+    }
+  });
+
+  const applyAssetInput = (asset, body, { creating = false } = {}) => {
+    if (creating || body.assetCode !== undefined) {
+      const assetCode = clean(body.assetCode, 30).toUpperCase();
+      if (!/^[A-Z0-9-]{2,30}$/.test(assetCode)) throw new Error("Enter a valid asset code.");
+      asset.assetCode = assetCode;
+    }
+    if (creating || body.name !== undefined) asset.name = clean(body.name, 160);
+    if (creating || body.acquisitionDate !== undefined) asset.acquisitionDate = nullableDay(body.acquisitionDate);
+    if (creating || body.cost !== undefined) asset.costKobo = parseNairaToKobo(body.cost);
+    if (body.category !== undefined) asset.category = clean(body.category, 100) || "Unassigned";
+    if (body.location !== undefined) asset.location = clean(body.location, 160);
+    if (body.condition !== undefined) asset.condition = clean(body.condition, 100);
+    if (body.usefulLifeMonths !== undefined) asset.usefulLifeMonths = optionalInteger(body.usefulLifeMonths, "Useful life", 1, 600);
+    if (body.residualValue !== undefined) asset.residualValueKobo = parseNairaToKobo(body.residualValue || "0");
+    if (body.openingAccumulatedDepreciation !== undefined) asset.openingAccumulatedDepreciationKobo = parseNairaToKobo(body.openingAccumulatedDepreciation || "0");
+    if (body.status !== undefined) {
+      const status = clean(body.status, 30);
+      if (!["review-required", "active", "disposed"].includes(status)) throw new Error("Choose a valid asset status.");
+      asset.status = status;
+    }
+    if (body.notes !== undefined) asset.notes = clean(body.notes, 500);
+    if (!asset.name) throw new Error("Asset name is required.");
+    if (!Number.isSafeInteger(asset.costKobo) || asset.costKobo <= 0) throw new Error("Asset cost must be greater than zero.");
+    if (asset.residualValueKobo > asset.costKobo) throw new Error("Residual value cannot exceed asset cost.");
+    if (asset.openingAccumulatedDepreciationKobo > asset.costKobo - asset.residualValueKobo) throw new Error("Accumulated depreciation cannot exceed the depreciable amount.");
+    if (asset.status === "active" && (!asset.acquisitionDate || !asset.usefulLifeMonths || asset.category === "Unassigned")) throw new Error("Complete the acquisition date, category and useful life before marking an asset active.");
+  };
+
+  router.post("/accounting/assets", accountantAuth, async (req, res) => {
+    try {
+      const asset = new AccountingAsset({ createdBy: req.accountant._id, updatedBy: req.accountant._id });
+      applyAssetInput(asset, req.body, { creating: true });
+      await asset.save();
+      res.status(201).json({ status: true, asset });
+    } catch (error) {
+      res.status(error.code === 11000 ? 409 : 400).json({ status: false, message: error.code === 11000 ? "That asset code already exists." : error.message || "Could not add the asset." });
+    }
+  });
+
+  router.patch("/accounting/assets/:id", accountantAuth, async (req, res) => {
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: "Invalid asset ID." });
+      const asset = await AccountingAsset.findById(req.params.id);
+      if (!asset) return res.status(404).json({ status: false, message: "Asset not found." });
+      applyAssetInput(asset, req.body);
+      asset.updatedBy = req.accountant._id;
+      await asset.save();
+      res.json({ status: true, asset });
+    } catch (error) {
+      res.status(error.code === 11000 ? 409 : 400).json({ status: false, message: error.code === 11000 ? "That asset code already exists." : error.message || "Could not update the asset." });
+    }
+  });
+
+  router.delete("/accounting/assets/:id", accountantAuth, async (req, res) => {
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: "Invalid asset ID." });
+      const deleted = await AccountingAsset.findOneAndDelete({ _id: req.params.id, status: "review-required" });
+      if (!deleted) return res.status(404).json({ status: false, message: "Only assets awaiting review can be deleted." });
+      res.json({ status: true, message: "Asset removed from the register." });
+    } catch {
+      res.status(500).json({ status: false, message: "Could not delete the asset." });
+    }
   });
 
   const normalizeJournal = async (body) => {
