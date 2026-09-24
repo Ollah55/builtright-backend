@@ -20,8 +20,10 @@ const accountingJournalSchema = new mongoose.Schema({
   postedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
   postedAt: { type: Date, default: null },
   reversalOf: { type: mongoose.Schema.Types.ObjectId, ref: "AccountingJournal", default: null },
+  amends: { type: mongoose.Schema.Types.ObjectId, ref: "AccountingJournal", default: null },
 }, { timestamps: true });
 
 accountingJournalSchema.index({ date: 1, status: 1 });
 accountingJournalSchema.index({ reversalOf: 1 }, { unique: true, partialFilterExpression: { reversalOf: { $type: "objectId" } } });
+accountingJournalSchema.index({ amends: 1 });
 export default mongoose.model("AccountingJournal", accountingJournalSchema);

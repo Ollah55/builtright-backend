@@ -185,7 +185,6 @@ export function accountingRoutes(requireAdminAuth) {
     if (!Number.isSafeInteger(asset.costKobo) || asset.costKobo <= 0) throw new Error("Asset cost must be greater than zero.");
     if (asset.residualValueKobo > asset.costKobo) throw new Error("Residual value cannot exceed asset cost.");
     if (asset.openingAccumulatedDepreciationKobo > asset.costKobo - asset.residualValueKobo) throw new Error("Accumulated depreciation cannot exceed the depreciable amount.");
-    if (asset.status === "active" && (!asset.acquisitionDate || !asset.usefulLifeMonths || asset.category === "Unassigned")) throw new Error("Complete the acquisition date, category and useful life before marking an asset active.");
   };
 
   router.post("/accounting/assets", accountantAuth, async (req, res) => {
@@ -302,6 +301,47 @@ export function accountingRoutes(requireAdminAuth) {
       const reversal = await AccountingJournal.create({ reference: `BRJ-REV-${crypto.randomBytes(7).toString("hex").toUpperCase()}`, date: dateAt(day), description: `Reversal of ${source.reference}: ${source.description}`, documentReference: source.documentReference, status: "posted", lines: source.lines.map((line) => ({ account: line.account, debitKobo: line.creditKobo, creditKobo: line.debitKobo, description: line.description, division: line.division, projectReference: line.projectReference })), createdBy: req.accountant._id, postedBy: req.accountant._id, postedAt: new Date(), reversalOf: source._id });
       res.status(201).json({ status: true, journal: reversal });
     } catch { res.status(500).json({ status: false, message: "Could not reverse journal." }); }
+  });
+
+  router.post("/accounting/journals/:id/amend", accountantAuth, async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: "Invalid journal ID." });
+      const normalized = await normalizeJournal(req.body);
+      let replacement;
+      await session.withTransaction(async () => {
+        const source = await AccountingJournal.findOne({ _id: req.params.id, status: "posted" }).session(session);
+        if (!source) throw new Error("Posted journal not found.");
+        if (source.reversalOf) throw new Error("A reversal entry cannot be corrected directly.");
+        if (await AccountingJournal.exists({ reversalOf: source._id }).session(session)) throw new Error("This journal has already been corrected or reversed.");
+        await AccountingJournal.create([{
+          reference: `BRJ-COR-REV-${crypto.randomBytes(6).toString("hex").toUpperCase()}`,
+          date: normalized.date,
+          description: `Correction reversal of ${source.reference}: ${source.description}`,
+          documentReference: source.documentReference,
+          status: "posted",
+          lines: source.lines.map((line) => ({ account: line.account, debitKobo: line.creditKobo, creditKobo: line.debitKobo, description: line.description, division: line.division, projectReference: line.projectReference })),
+          createdBy: req.accountant._id,
+          postedBy: req.accountant._id,
+          postedAt: new Date(),
+          reversalOf: source._id,
+        }], { session });
+        [replacement] = await AccountingJournal.create([{
+          ...normalized,
+          reference: `BRJ-COR-${crypto.randomBytes(7).toString("hex").toUpperCase()}`,
+          status: "posted",
+          createdBy: req.accountant._id,
+          postedBy: req.accountant._id,
+          postedAt: new Date(),
+          amends: source._id,
+        }], { session });
+      });
+      res.status(201).json({ status: true, journal: replacement });
+    } catch (error) {
+      res.status(400).json({ status: false, message: error.message || "Could not correct the journal." });
+    } finally {
+      await session.endSession();
+    }
   });
 
   const book = async () => {
