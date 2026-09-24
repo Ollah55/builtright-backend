@@ -28,7 +28,7 @@ const optionalInteger = (value, label, minimum = 0, maximum = Number.MAX_SAFE_IN
   if (!Number.isSafeInteger(result) || result < minimum || result > maximum) throw new Error(`${label} is invalid.`);
   return result;
 };
-const userView = (user) => ({ id: user._id, fullName: user.fullName, email: user.email, isActive: user.isActive, invitedAt: user.accountantProfile?.invitedAt, invitationExpiresAt: user.accountantProfile?.invitationExpiresAt, activatedAt: user.accountantProfile?.activatedAt });
+const userView = (user) => ({ id: user._id, fullName: user.fullName, email: user.email, isActive: user.isActive, invitedAt: user.accountantProfile?.invitedAt, invitationExpiresAt: user.accountantProfile?.invitationExpiresAt, activatedAt: user.accountantProfile?.activatedAt, passwordResetSentAt: user.accountantProfile?.passwordResetSentAt });
 
 export function accountingRoutes(requireAdminAuth) {
   const accountantAuth = async (req, res, next) => {
@@ -48,8 +48,49 @@ export function accountingRoutes(requireAdminAuth) {
 
   router.get("/admin/accountant", requireAdminAuth, async (_req, res) => {
     try {
-      const users = await User.find({ role: "accountant" }).sort({ createdAt: -1 }).select("fullName email isActive accountantProfile.invitedAt accountantProfile.invitationExpiresAt accountantProfile.activatedAt").lean();
-      res.json({ status: true, startDate: ACCOUNTING_START_DATE, accountants: users.map(userView) });
+      const [users, accounts, postedJournals, draftJournals, assets, recentJournals] = await Promise.all([
+        User.find({ role: "accountant" }).sort({ createdAt: -1 }).select("fullName email isActive accountantProfile.invitedAt accountantProfile.invitationExpiresAt accountantProfile.activatedAt accountantProfile.passwordResetSentAt").lean(),
+        AccountingAccount.find().sort({ code: 1 }).lean(),
+        AccountingJournal.find({ status: "posted" }).select("date status reference description documentReference lines").lean(),
+        AccountingJournal.countDocuments({ status: "draft" }),
+        AccountingAsset.find().select("costKobo status").lean(),
+        AccountingJournal.find().sort({ date: -1, createdAt: -1 }).limit(8).select("date reference description status lines reversalOf amends").lean(),
+      ]);
+      const trial = trialBalance(accounts, postedJournals);
+      const pnl = profitAndLoss(accounts, postedJournals, ACCOUNTING_START_DATE, null);
+      const position = balanceSheet(accounts, postedJournals);
+      res.json({
+        status: true,
+        startDate: ACCOUNTING_START_DATE,
+        accountants: users.map(userView),
+        summary: {
+          activeAccounts: accounts.filter((account) => account.isActive).length,
+          fixedAssets: assets.filter((asset) => asset.status === "active").length,
+          fixedAssetCostKobo: assets.reduce((sum, asset) => sum + asset.costKobo, 0),
+          postedJournals: postedJournals.length,
+          draftJournals,
+          totalRevenueKobo: pnl.totalRevenueKobo,
+          totalExpenseKobo: pnl.totalExpenseKobo,
+          netProfitKobo: pnl.netProfitKobo,
+          totalAssetsKobo: position.totalAssetsKobo,
+          totalLiabilitiesKobo: position.totalLiabilitiesKobo,
+          totalEquityKobo: position.totalEquityKobo,
+          balanceSheetDifferenceKobo: position.differenceKobo,
+          trialBalanceDebitKobo: trial.totalDebitKobo,
+          trialBalanceCreditKobo: trial.totalCreditKobo,
+          trialBalanceBalanced: trial.balanced,
+        },
+        recentJournals: recentJournals.map((journal) => ({
+          id: journal._id,
+          date: journal.date,
+          reference: journal.reference,
+          description: journal.description,
+          status: journal.status,
+          debitKobo: journal.lines.reduce((sum, line) => sum + line.debitKobo, 0),
+          reversalOf: journal.reversalOf,
+          amends: journal.amends,
+        })),
+      });
     } catch { res.status(500).json({ status: false, message: "Could not load accountant access." }); }
   });
 
@@ -87,9 +128,35 @@ export function accountingRoutes(requireAdminAuth) {
       user.isActive = false;
       user.accountantProfile.invitationTokenHash = "";
       user.accountantProfile.invitationExpiresAt = null;
+      user.accountantProfile.passwordResetTokenHash = "";
+      user.accountantProfile.passwordResetExpiresAt = null;
       await user.save();
       res.json({ status: true, message: "Accountant access revoked. Historical journal attribution is retained." });
     } catch { res.status(500).json({ status: false, message: "Could not revoke access." }); }
+  });
+
+  router.post("/admin/accountant/:id/password-reset", requireAdminAuth, async (req, res) => {
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: "Invalid accountant ID." });
+      const user = await User.findOne({ _id: req.params.id, role: "accountant", isActive: true });
+      if (!user) return res.status(404).json({ status: false, message: "Active accountant not found." });
+      const raw = crypto.randomBytes(32).toString("hex");
+      user.accountantProfile.passwordResetTokenHash = tokenHash(raw);
+      user.accountantProfile.passwordResetExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      user.accountantProfile.passwordResetSentAt = new Date();
+      await user.save();
+      const link = `${process.env.FRONTEND_URL || "https://www.builtrightltd.com"}/accounting/reset-password?token=${encodeURIComponent(raw)}`;
+      const safeName = user.fullName.replace(/[&<>"']/g, "");
+      await sendEmail({
+        to: user.email,
+        subject: "Reset your BuiltRight accountant password",
+        html: `<h2>BuiltRight Accounting</h2><p>Hello ${safeName},</p><p>An administrator requested a password reset for your accountant account.</p><p><a href="${link}">Set a new password</a> within one hour.</p><p>If you did not expect this email, contact BuiltRight administration. Your current password remains active until a new one is set.</p>`,
+      });
+      res.json({ status: true, message: `Password reset link sent to ${user.email}. It expires in one hour.` });
+    } catch (error) {
+      console.error("ACCOUNTANT PASSWORD RESET EMAIL ERROR:", error);
+      res.status(500).json({ status: false, message: "Could not send the password reset link. Please try again." });
+    }
   });
 
   router.post("/accounting/activate", async (req, res) => {
@@ -107,6 +174,28 @@ export function accountingRoutes(requireAdminAuth) {
       await user.save();
       res.json({ status: true, message: "Accountant account activated. You can now sign in." });
     } catch { res.status(500).json({ status: false, message: "Could not activate accountant account." }); }
+  });
+
+  router.post("/accounting/reset-password", async (req, res) => {
+    try {
+      const raw = clean(req.body.token, 128);
+      const password = String(req.body.password || "");
+      if (!/^[a-f0-9]{64}$/.test(raw) || password.length < 12) return res.status(400).json({ status: false, message: "Use a valid password-reset link and a password of at least 12 characters." });
+      const user = await User.findOne({
+        role: "accountant",
+        isActive: true,
+        "accountantProfile.passwordResetTokenHash": tokenHash(raw),
+        "accountantProfile.passwordResetExpiresAt": { $gt: new Date() },
+      });
+      if (!user) return res.status(400).json({ status: false, message: "This password reset link is invalid or expired." });
+      user.password = await bcrypt.hash(password, 12);
+      user.accountantProfile.passwordResetTokenHash = "";
+      user.accountantProfile.passwordResetExpiresAt = null;
+      await user.save();
+      res.json({ status: true, message: "Password updated. You can now sign in with your new password." });
+    } catch {
+      res.status(500).json({ status: false, message: "Could not reset the accountant password." });
+    }
   });
 
   router.post("/accounting/login", async (req, res) => {

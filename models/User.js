@@ -74,6 +74,9 @@ const userSchema = new mongoose.Schema(
       invitationExpiresAt: { type: Date, default: null },
       invitedAt: { type: Date, default: null },
       activatedAt: { type: Date, default: null },
+      passwordResetTokenHash: { type: String, default: "" },
+      passwordResetExpiresAt: { type: Date, default: null },
+      passwordResetSentAt: { type: Date, default: null },
     },
   },
   { timestamps: true }
