@@ -6,6 +6,7 @@ import mongoose from "mongoose";
 import User from "../models/User.js";
 import AccountingAccount from "../models/AccountingAccount.js";
 import AccountingAsset from "../models/AccountingAsset.js";
+import AccountingBalanceControl from "../models/AccountingBalanceControl.js";
 import AccountingJournal from "../models/AccountingJournal.js";
 import sendEmail from "../utils/sendEmail.js";
 import { accountBalances, balanceSheet, generalLedger, normalSideForType, parseNairaToKobo, profitAndLoss, trialBalance, validateJournalLines } from "./accountingMath.js";
@@ -27,6 +28,15 @@ const optionalInteger = (value, label, minimum = 0, maximum = Number.MAX_SAFE_IN
   const result = Number(value);
   if (!Number.isSafeInteger(result) || result < minimum || result > maximum) throw new Error(`${label} is invalid.`);
   return result;
+};
+const nullableMoney = (value) => {
+  if (value === null || value === undefined || value === "") return null;
+  return parseNairaToKobo(value);
+};
+const dayBefore = (day) => {
+  const date = new Date(`${day}T12:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() - 1);
+  return date;
 };
 const userView = (user) => ({ id: user._id, fullName: user.fullName, email: user.email, isActive: user.isActive, invitedAt: user.accountantProfile?.invitedAt, invitationExpiresAt: user.accountantProfile?.invitationExpiresAt, activatedAt: user.accountantProfile?.activatedAt, passwordResetSentAt: user.accountantProfile?.passwordResetSentAt });
 
@@ -238,6 +248,140 @@ export function accountingRoutes(requireAdminAuth) {
       await account.save();
       res.json({ status: true, account });
     } catch { res.status(500).json({ status: false, message: "Could not update account." }); }
+  });
+
+  router.get("/accounting/balance-controls", accountantAuth, async (_req, res) => {
+    try {
+      const [controls, journals] = await Promise.all([
+        AccountingBalanceControl.find()
+          .populate("account", "code name type normalSide isActive")
+          .populate("offsetAccount", "code name type normalSide isActive")
+          .sort({ createdAt: 1 })
+          .lean(),
+        AccountingJournal.find({ status: "posted" }).select("date status reference description documentReference lines").lean(),
+      ]);
+      res.json({
+        status: true,
+        startDate: ACCOUNTING_START_DATE,
+        controls: controls.map((control) => {
+          const closingDay = control.actualClosingAsOf
+            ? new Date(control.actualClosingAsOf).toISOString().slice(0, 10)
+            : null;
+          const bookClosingKobo = control.account
+            ? generalLedger(control.account, journals, null, closingDay).closingKobo
+            : 0;
+          return { ...control, bookClosingKobo };
+        }),
+      });
+    } catch (error) {
+      console.error("ACCOUNTING BALANCE CONTROL ERROR:", error);
+      res.status(500).json({ status: false, message: "Could not load opening and closing balances." });
+    }
+  });
+
+  router.put("/accounting/balance-controls/:accountId", accountantAuth, async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      if (!mongoose.isValidObjectId(req.params.accountId)) return res.status(400).json({ status: false, message: "Select a valid balance-sheet account." });
+      const account = await AccountingAccount.findOne({ _id: req.params.accountId, isActive: true });
+      if (!account || ["revenue", "expense"].includes(account.type)) return res.status(400).json({ status: false, message: "Opening balances are available only for active balance-sheet accounts." });
+
+      const openingBalanceKobo = nullableMoney(req.body.openingBalance);
+      const actualClosingBalanceKobo = nullableMoney(req.body.actualClosingBalance);
+      const actualClosingDay = clean(req.body.actualClosingAsOf, 10);
+      if (actualClosingBalanceKobo !== null && !validDay(actualClosingDay)) return res.status(400).json({ status: false, message: "Choose the date of the actual closing balance." });
+      if (actualClosingBalanceKobo === null && actualClosingDay && !validDay(actualClosingDay)) return res.status(400).json({ status: false, message: "Choose a valid closing-balance date." });
+
+      let offsetAccount = null;
+      if (openingBalanceKobo !== null && openingBalanceKobo > 0) {
+        if (!mongoose.isValidObjectId(req.body.offsetAccount) || String(req.body.offsetAccount) === String(account._id)) return res.status(400).json({ status: false, message: "Select a different balancing account for the opening balance." });
+        offsetAccount = await AccountingAccount.findOne({ _id: req.body.offsetAccount, isActive: true });
+        if (!offsetAccount || ["revenue", "expense"].includes(offsetAccount.type)) return res.status(400).json({ status: false, message: "The balancing account must be an active asset, liability or equity account." });
+      }
+
+      let saved;
+      await session.withTransaction(async () => {
+        let control = await AccountingBalanceControl.findOne({ account: account._id }).session(session);
+        if (!control) control = new AccountingBalanceControl({ account: account._id, updatedBy: req.accountant._id });
+        const openingChanged =
+          control.openingBalanceKobo !== openingBalanceKobo ||
+          String(control.offsetAccount || "") !== String(offsetAccount?._id || "");
+
+        if (openingChanged && control.openingJournal) {
+          const source = await AccountingJournal.findOne({ _id: control.openingJournal, status: "posted" }).session(session);
+          if (source && !(await AccountingJournal.exists({ reversalOf: source._id }).session(session))) {
+            await AccountingJournal.create([{
+              reference: `BRJ-OPEN-REV-${crypto.randomBytes(6).toString("hex").toUpperCase()}`,
+              date: dayBefore(ACCOUNTING_START_DATE),
+              description: `Opening balance correction reversal: ${account.code} ${account.name}`,
+              documentReference: source.documentReference,
+              status: "posted",
+              lines: source.lines.map((line) => ({
+                account: line.account,
+                debitKobo: line.creditKobo,
+                creditKobo: line.debitKobo,
+                description: line.description,
+              })),
+              createdBy: req.accountant._id,
+              postedBy: req.accountant._id,
+              postedAt: new Date(),
+              reversalOf: source._id,
+            }], { session });
+          }
+        }
+
+        let openingJournal = control.openingJournal || null;
+        if (openingChanged && openingBalanceKobo !== null && openingBalanceKobo > 0) {
+          const primaryDebit = account.normalSide === "debit";
+          [openingJournal] = await AccountingJournal.create([{
+            reference: `BRJ-OPEN-${crypto.randomBytes(7).toString("hex").toUpperCase()}`,
+            date: dayBefore(ACCOUNTING_START_DATE),
+            description: `Management-confirmed opening balance: ${account.code} ${account.name}`,
+            documentReference: `OPENING-BALANCE-${account.code}`,
+            status: "posted",
+            lines: [
+              {
+                account: account._id,
+                debitKobo: primaryDebit ? openingBalanceKobo : 0,
+                creditKobo: primaryDebit ? 0 : openingBalanceKobo,
+                description: `Opening balance for ${account.name}`,
+              },
+              {
+                account: offsetAccount._id,
+                debitKobo: primaryDebit ? 0 : openingBalanceKobo,
+                creditKobo: primaryDebit ? openingBalanceKobo : 0,
+                description: `Balancing entry for ${account.name} opening balance`,
+              },
+            ],
+            createdBy: req.accountant._id,
+            postedBy: req.accountant._id,
+            postedAt: new Date(),
+          }], { session });
+        } else if (openingChanged) {
+          openingJournal = null;
+        }
+
+        control.openingBalanceKobo = openingBalanceKobo;
+        control.offsetAccount = offsetAccount?._id || null;
+        control.openingJournal = openingJournal?._id || null;
+        control.actualClosingBalanceKobo = actualClosingBalanceKobo;
+        control.actualClosingAsOf =
+          actualClosingBalanceKobo !== null && actualClosingDay
+            ? dateAt(actualClosingDay)
+            : null;
+        control.updatedBy = req.accountant._id;
+        saved = await control.save({ session });
+      });
+
+      await saved.populate("account", "code name type normalSide isActive");
+      await saved.populate("offsetAccount", "code name type normalSide isActive");
+      res.json({ status: true, message: "Opening and closing balance figures saved. Any opening-balance change is now reflected in the books.", control: saved });
+    } catch (error) {
+      console.error("ACCOUNTING BALANCE UPDATE ERROR:", error);
+      res.status(400).json({ status: false, message: error.message || "Could not update opening and closing balances." });
+    } finally {
+      await session.endSession();
+    }
   });
 
   router.get("/accounting/assets", accountantAuth, async (_req, res) => {
