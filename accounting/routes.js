@@ -523,19 +523,6 @@ export function accountingRoutes(requireAdminAuth) {
     } catch (error) { res.status(400).json({ status: false, message: error.message || "Could not post journal." }); }
   });
 
-  router.post("/accounting/journals/:id/reverse", accountantAuth, async (req, res) => {
-    try {
-      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: "Invalid journal ID." });
-      const source = await AccountingJournal.findOne({ _id: req.params.id, status: "posted" });
-      if (!source) return res.status(404).json({ status: false, message: "Posted journal not found." });
-      if (await AccountingJournal.exists({ reversalOf: source._id })) return res.status(409).json({ status: false, message: "This journal already has a reversal." });
-      const day = clean(req.body.date, 10);
-      if (!validDay(day)) return res.status(400).json({ status: false, message: "Choose a valid reversal date." });
-      const reversal = await AccountingJournal.create({ reference: `BRJ-REV-${crypto.randomBytes(7).toString("hex").toUpperCase()}`, date: dateAt(day), description: `Reversal of ${source.reference}: ${source.description}`, documentReference: source.documentReference, status: "posted", lines: source.lines.map((line) => ({ account: line.account, debitKobo: line.creditKobo, creditKobo: line.debitKobo, description: line.description, division: line.division, projectReference: line.projectReference })), createdBy: req.accountant._id, postedBy: req.accountant._id, postedAt: new Date(), reversalOf: source._id });
-      res.status(201).json({ status: true, journal: reversal });
-    } catch { res.status(500).json({ status: false, message: "Could not reverse journal." }); }
-  });
-
   router.post("/accounting/journals/:id/amend", accountantAuth, async (req, res) => {
     const session = await mongoose.startSession();
     try {
