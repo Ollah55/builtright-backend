@@ -33,7 +33,7 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["customer", "admin", "installer", "learner", "accountant"],
+      enum: ["customer", "admin", "installer", "learner", "accountant", "sales"],
       default: "customer",
     },
     isActive: {
@@ -77,6 +77,13 @@ const userSchema = new mongoose.Schema(
       passwordResetTokenHash: { type: String, default: "" },
       passwordResetExpiresAt: { type: Date, default: null },
       passwordResetSentAt: { type: Date, default: null },
+    },
+    salesProfile: {
+      invitationToken: { type: String, default: "" },
+      invitationExpiresAt: { type: Date, default: null },
+      invitedAt: { type: Date, default: null },
+      invitationEmailSentAt: { type: Date, default: null },
+      activatedAt: { type: Date, default: null },
     },
   },
   { timestamps: true }

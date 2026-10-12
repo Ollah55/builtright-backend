@@ -32,6 +32,19 @@ const loanRequestSchema = new mongoose.Schema(
       },
     },
 
+    intake: {
+      source: {
+        type: String,
+        enum: ["website", "sales-whatsapp", "admin"],
+        default: "website",
+        index: true,
+      },
+      createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+      createdByName: { type: String, default: "", trim: true },
+      createdByEmail: { type: String, default: "", trim: true, lowercase: true },
+      capturedAt: { type: Date, default: Date.now },
+    },
+
     productSource: {
       type: String,
       enum: ["BuiltRight Marketplace", "External Vendor"],
