@@ -2705,21 +2705,29 @@ app.get("/api/installer/assignments", requireInstallerAuth, async (req, res) => 
 app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (req, res) => {
   try {
     const { scheduledAt, location, inspectionFeeAmount } = req.body;
+    const normalizedScheduledAt = String(scheduledAt || "").trim();
+    const normalizedLocation = String(location || "").trim();
+    const normalizedFee = Number(String(inspectionFeeAmount ?? "").replace(/[^\d.]/g, ""));
     const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
     if (!loanRequest || !["assigned", "accepted"].includes(loanRequest.installerAssignment?.status)) {
       return res.status(404).json({ status: false, message: "This assignment is no longer available for acceptance." });
     }
-    if (!scheduledAt && !location && !inspectionFeeAmount) {
+    if (!normalizedScheduledAt && !normalizedLocation && !normalizedFee) {
       loanRequest.installerAssignment.status = "accepted";
       loanRequest.installerAssignment.acceptedAt ||= new Date();
       loanRequest.installerAssignment.history.push({ installer: req.installer.id, installerName: loanRequest.installerAssignment.installerName, status: "accepted", note: "Installer accepted the assignment and will contact the customer before scheduling.", changedAt: new Date() });
       await loanRequest.save();
       return res.json({ status: true, message: "Assignment accepted. Contact the customer, then enter the agreed inspection schedule and fee.", loanRequest });
     }
-    if (!scheduledAt || !location || Number(inspectionFeeAmount) <= 0) {
-      return res.status(400).json({ status: false, message: "Inspection date, time, location, and a fee amount are required." });
+    const missingFields = [
+      !normalizedScheduledAt ? "date and time" : "",
+      !normalizedLocation ? "location" : "",
+      !(normalizedFee > 0) ? "fee amount" : "",
+    ].filter(Boolean);
+    if (missingFields.length) {
+      return res.status(400).json({ status: false, message: `Please enter a valid ${missingFields.join(", ")}.` });
     }
-    const scheduledDate = new Date(scheduledAt);
+    const scheduledDate = new Date(normalizedScheduledAt);
     if (Number.isNaN(scheduledDate.getTime()) || scheduledDate <= new Date()) {
       return res.status(400).json({ status: false, message: "Choose a future inspection date and time." });
     }
@@ -2729,8 +2737,8 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
     loanRequest.inspection.status = "scheduled";
     loanRequest.inspection.scheduledAt = scheduledDate;
     loanRequest.inspection.assignee = loanRequest.installerAssignment.installerName;
-    loanRequest.inspection.notes = `Inspection location: ${location}`;
-    loanRequest.inspection.feeAmount = Number(inspectionFeeAmount);
+    loanRequest.inspection.notes = `Inspection location: ${normalizedLocation}`;
+    loanRequest.inspection.feeAmount = normalizedFee;
     loanRequest.inspection.feeStatus = "payment-requested";
     loanRequest.assessment.inspection.status = "scheduled";
     loanRequest.assessment.status = "in-progress";
@@ -2741,7 +2749,7 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
       await sendEmail({
         to: loanRequest.customer.email,
         subject: `BuiltRight inspection scheduled - ${loanRequest.reference}`,
-        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(location)}</li><li><strong>Inspection fee:</strong> ${formatNaira(inspectionFeeAmount)}</li></ul><p>Please make the inspection-fee payment using the details below. Then sign in to your BuiltRight customer profile, upload your payment proof, and click <strong>I have paid — submit proof</strong>. Your installer can begin the inspection only after confirming receipt.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul><p><a href="${frontendUrl()}/customer/financing">Open customer profile</a></p>`,
+        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(normalizedLocation)}</li><li><strong>Inspection fee:</strong> ${formatNaira(normalizedFee)}</li></ul><p>Please make the inspection-fee payment using the details below. Then sign in to your BuiltRight customer profile, upload your payment proof, and click <strong>I have paid — submit proof</strong>. Your installer can begin the inspection only after confirming receipt.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul><p><a href="${frontendUrl()}/customer/financing">Open customer profile</a></p>`,
       });
     } catch (mailError) {
       console.error("INSPECTION SCHEDULE EMAIL ERROR:", mailError.message);
