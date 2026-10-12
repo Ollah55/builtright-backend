@@ -35,7 +35,7 @@ const loanRequestSchema = new mongoose.Schema(
     intake: {
       source: {
         type: String,
-        enum: ["website", "sales-whatsapp", "admin"],
+        enum: ["website", "sales-whatsapp", "sales-assisted", "admin"],
         default: "website",
         index: true,
       },
