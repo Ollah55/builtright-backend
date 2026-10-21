@@ -1912,14 +1912,21 @@ const assignSpecificInstallerToLoanRequest = async (loanRequest, installerId, as
   return installer;
 };
 
-const sendSubmissionConfirmationEmail = async (loanRequest) => {
+const sendSubmissionConfirmationEmail = async (loanRequest, order = null) => {
   const installerName = loanRequest.installerAssignment?.installerName || "a BuiltRight installer";
   const isOutright = loanRequest.paymentMethod === "outright";
   const salesAssisted = ["sales-whatsapp", "sales-assisted"].includes(loanRequest.intake?.source);
+  const completedOffline = loanRequest.inspection?.status === "completed" && !loanRequest.installerAssignment?.installer;
+  const assessmentMessage = completedOffline
+    ? "Your completed offline inspection, load audit, and assessment payment have been recorded. BuiltRight will now verify the assessment details and continue the due-diligence and quotation process."
+    : `${safeHtml(installerName)} has been assigned and will contact you shortly to arrange a convenient time for your site inspection.`;
+  const orderMessage = order?.orderNumber
+    ? `<p>Your project order <strong>${safeHtml(order.orderNumber)}</strong> has been opened and is currently being processed. The amount will be updated after the final project quotation is approved.</p>`
+    : "";
   await sendEmail({
     to: loanRequest.customer.email,
     subject: `BuiltRight ${isOutright ? "outright-purchase" : "financing"} request received - ${loanRequest.reference}`,
-    html: `<h2>Your ${isOutright ? "outright-purchase" : "financing"} request was submitted successfully</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>We have received your request ${safeHtml(loanRequest.reference)}. ${safeHtml(installerName)} has been assigned and will contact you shortly to arrange a convenient time for your site inspection.</p><p>After the required assessment and due diligence, BuiltRight will prepare your final project quotation for approval.${isOutright ? " Once approved, you will receive a BuiltRight invoice for the full confirmed project cost." : ""}</p>${salesAssisted ? `<p><a href="${frontendUrl()}/auth">Create or sign in to your BuiltRight customer profile</a> using this email address to view project updates and documents.</p>` : ""}`,
+    html: `<h2>Your ${isOutright ? "outright-purchase" : "financing"} request was submitted successfully</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>We have received your request ${safeHtml(loanRequest.reference)}. ${assessmentMessage}</p>${orderMessage}<p>After the required assessment and due diligence, BuiltRight will prepare your final project quotation for approval.${isOutright ? " Once approved, you will receive a BuiltRight invoice for the full confirmed project cost." : ""}</p>${salesAssisted ? `<p><a href="${frontendUrl()}/auth">Create or sign in to your BuiltRight customer profile</a> using this email address to view project updates and documents.</p>` : ""}`,
   });
 };
 
@@ -2340,10 +2347,11 @@ app.get("/api/loan-requests/:id/workspace", requireOperationsAuth, async (req, r
       return res.status(404).json({ status: false, message: "Financing case not found." });
     }
 
-    const documents = await ProjectDocument.find({ financingRequest: loanRequest._id })
-      .sort({ createdAt: -1 })
-      .lean();
-    return res.json({ status: true, loanRequest, documents });
+    const [documents, order] = await Promise.all([
+      ProjectDocument.find({ financingRequest: loanRequest._id }).sort({ createdAt: -1 }).lean(),
+      Order.findOne({ financingRequestId: loanRequest._id }).lean(),
+    ]);
+    return res.json({ status: true, loanRequest, documents, order });
   } catch (error) {
     console.error("LOAD FINANCING WORKSPACE ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not load the financing workspace." });
@@ -2408,18 +2416,49 @@ app.get("/api/sales/installers", requireOperationsAuth, async (req, res) => {
   }
 });
 
+app.get("/api/sales/projects", requireOperationsAuth, async (req, res) => {
+  try {
+    const projects = await LoanRequest.find({ "testRun.isTest": { $ne: true } })
+      .sort({ createdAt: -1 })
+      .lean();
+    const projectIds = projects.map((project) => project._id);
+    const [orders, invoices] = await Promise.all([
+      Order.find({ financingRequestId: { $in: projectIds } }).lean(),
+      ProjectDocument.find({ financingRequest: { $in: projectIds }, type: "invoice" })
+        .sort({ createdAt: -1 })
+        .lean(),
+    ]);
+    const ordersByProject = new Map(orders.map((order) => [String(order.financingRequestId), order]));
+    const invoicesByProject = new Map();
+    invoices.forEach((invoice) => {
+      const key = String(invoice.financingRequest);
+      if (!invoicesByProject.has(key)) invoicesByProject.set(key, invoice);
+    });
+    const customers = projects.map((project) => ({
+      ...project,
+      order: ordersByProject.get(String(project._id)) || null,
+      invoice: invoicesByProject.get(String(project._id)) || null,
+    }));
+    return res.json({ status: true, customers });
+  } catch (error) {
+    console.error("SALES CUSTOMER LIST ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load registered customers." });
+  }
+});
+
 app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
   try {
-    const { customer = {}, installerId, inspectionFeeAmount, paymentMethod, financeInstitution, systemDescription, notes, consentCaptured } = req.body;
+    const { customer = {}, installerId, inspectionFeeAmount, paymentMethod, financeInstitution, systemDescription, notes, consentCaptured, inspectionCompleted } = req.body;
     if (!customer.fullName || !customer.email || !customer.phone || !customer.location) {
       return res.status(400).json({ status: false, message: "Customer name, email, phone number, and project location are required." });
     }
     if (!consentCaptured) {
       return res.status(400).json({ status: false, message: "Confirm that the customer consented to BuiltRight recording and using the supplied project information." });
     }
-    if (!installerId) return res.status(400).json({ status: false, message: "Select the installer who will perform the site assessment." });
+    const completedOffline = Boolean(inspectionCompleted);
+    if (!completedOffline && !installerId) return res.status(400).json({ status: false, message: "Select the installer who will perform the site assessment." });
     const normalizedFee = Number(String(inspectionFeeAmount ?? "").replace(/[^\d.]/g, ""));
-    if (!(normalizedFee > 0)) return res.status(400).json({ status: false, message: "Enter an assessment fee greater than zero." });
+    if (!completedOffline && !(normalizedFee > 0)) return res.status(400).json({ status: false, message: "Enter an assessment fee greater than zero." });
     const selectedPaymentMethod = paymentMethod === "outright" ? "outright" : "bank-financing";
     const selectedFinanceInstitution = selectedPaymentMethod === "outright" ? "Not applicable — outright payment" : (financeInstitution || "Bank partner pending");
     const equityPercentage = selectedPaymentMethod === "outright" ? 100 : (selectedFinanceInstitution === "LOTUS Bank" ? 10 : 20);
@@ -2443,13 +2482,19 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
       bankApplication: { provider: selectedFinanceInstitution, status: selectedPaymentMethod === "outright" ? "not-required" : "not-started" },
       deposit: { percentage: equityPercentage, status: "not-due" },
       assessment: {
-        status: "open",
+        status: completedOffline ? "in-progress" : "open",
         triggeredAt: new Date(),
-        inspection: { status: "pending", result: "pending" },
+        inspection: completedOffline
+          ? { status: "completed", result: "pass", completedAt: new Date(), completedBy: salesName, notes: "Site inspection was completed and confirmed through the offline/WhatsApp sales process." }
+          : { status: "pending", result: "pending" },
         loadAudit: {
-          status: "pending",
-          result: "pending",
-          notes: "Projected load discussion completed by sales on WhatsApp. Installer will record the verified on-site load audit.",
+          status: completedOffline ? "completed" : "pending",
+          result: completedOffline ? "pass" : "pending",
+          completedAt: completedOffline ? new Date() : null,
+          completedBy: completedOffline ? salesName : "",
+          notes: completedOffline
+            ? "Customer load audit was completed through the offline/WhatsApp sales process. Sales must record the verified sizing details before preparing the final quotation."
+            : "Projected load discussion completed by sales on WhatsApp. Installer will record the verified on-site load audit.",
         },
         dueDiligence: {
           status: "pending",
@@ -2463,20 +2508,61 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
           ],
         },
       },
-      inspection: { feeAmount: normalizedFee, feeStatus: "not-requested", status: "not-scheduled" },
-      status: "submitted",
-      statusHistory: [{ status: "submitted", source: "sales", note: `Customer assessment booking created by ${salesName}; assessment fee recorded by sales.` }],
+      inspection: completedOffline
+        ? { feeAmount: normalizedFee > 0 ? normalizedFee : null, feeStatus: "payment-confirmed", status: "completed", completedAt: new Date(), paymentConfirmedAt: new Date() }
+        : { feeAmount: normalizedFee, feeStatus: "not-requested", status: "not-scheduled" },
+      status: completedOffline ? "inspection-completed" : "submitted",
+      statusHistory: [{
+        status: completedOffline ? "inspection-completed" : "submitted",
+        source: "sales",
+        note: completedOffline
+          ? `Customer registered by ${salesName}; offline/WhatsApp inspection, load audit, and assessment payment recorded as completed.`
+          : `Customer assessment booking created by ${salesName}; assessment fee recorded by sales.`,
+      }],
       notes: String(notes || ""),
     });
-    const installer = await assignSpecificInstallerToLoanRequest(loanRequest, installerId, salesName);
-    if (!installer) {
-      await LoanRequest.deleteOne({ _id: loanRequest._id });
-      return res.status(409).json({ status: false, message: "The selected installer is no longer available. Refresh and choose another installer." });
+    let installer = null;
+    if (!completedOffline) {
+      installer = await assignSpecificInstallerToLoanRequest(loanRequest, installerId, salesName);
+      if (!installer) {
+        await LoanRequest.deleteOne({ _id: loanRequest._id });
+        return res.status(409).json({ status: false, message: "The selected installer is no longer available. Refresh and choose another installer." });
+      }
     }
     await loanRequest.save();
-    try { await sendInstallerAssignmentEmail(loanRequest, installer); } catch (mailError) { console.error("SALES ASSIGNMENT EMAIL ERROR:", mailError.message); }
-    try { await sendSubmissionConfirmationEmail(loanRequest); } catch (mailError) { console.error("SALES CUSTOMER CONFIRMATION ERROR:", mailError.message); }
-    return res.status(201).json({ status: true, message: `Customer registered and site assessment assigned to ${installer.fullName}.`, loanRequest });
+    let order;
+    try {
+      order = await Order.create({
+        orderNumber: generateOrderNumber(),
+        reference: `FIN-${loanRequest.reference}`,
+        source: selectedPaymentMethod === "outright" ? "Manual" : "Financing",
+        customer: {
+          fullName: loanRequest.customer.fullName,
+          email: loanRequest.customer.email,
+          phone: loanRequest.customer.phone,
+        },
+        items: loanRequest.items,
+        amount: null,
+        date: new Date().toLocaleDateString("en-NG"),
+        status: "Processing",
+        financingRequestId: loanRequest._id,
+      });
+    } catch (orderError) {
+      await LoanRequest.deleteOne({ _id: loanRequest._id });
+      throw orderError;
+    }
+    if (installer) {
+      try { await sendInstallerAssignmentEmail(loanRequest, installer); } catch (mailError) { console.error("SALES ASSIGNMENT EMAIL ERROR:", mailError.message); }
+    }
+    try { await sendSubmissionConfirmationEmail(loanRequest, order); } catch (mailError) { console.error("SALES CUSTOMER CONFIRMATION ERROR:", mailError.message); }
+    return res.status(201).json({
+      status: true,
+      message: completedOffline
+        ? `Customer registered, offline assessment recorded, and order ${order.orderNumber} created.`
+        : `Customer registered, order ${order.orderNumber} created, and site assessment assigned to ${installer.fullName}.`,
+      loanRequest,
+      order,
+    });
   } catch (error) {
     console.error("CREATE SALES PROJECT ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not register the customer project." });
@@ -3474,6 +3560,11 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
         });
       } else {
         createdOrder = existingOrder;
+        createdOrder.source = "Financing";
+        createdOrder.items = safeItems;
+        createdOrder.amount = loanRequest.finalProjectCost ?? loanRequest.estimatedAmount ?? null;
+        createdOrder.status = "Confirmed";
+        await createdOrder.save();
       }
 
       const existingInvoice = await ProjectDocument.findOne({
