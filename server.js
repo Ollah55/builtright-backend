@@ -411,7 +411,7 @@ const requireAdminAuth = (req, res, next) => {
   }
 };
 
-const requireOperationsAuth = (req, res, next) => {
+const requireOperationsAuth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -421,6 +421,10 @@ const requireOperationsAuth = (req, res, next) => {
     if (!["admin", "sales"].includes(decoded.role)) {
       return res.status(403).json({ status: false, message: "BuiltRight operations access required." });
     }
+    if (decoded.role === "sales") {
+      const salesUser = await User.findOne({ _id: decoded.id, role: "sales", isActive: true }).select("_id").lean();
+      if (!salesUser) return res.status(403).json({ status: false, message: "This sales account is no longer active." });
+    }
     req.admin = decoded;
     req.staff = decoded;
     next();
@@ -429,7 +433,7 @@ const requireOperationsAuth = (req, res, next) => {
   }
 };
 
-const requireCustomerAuth = (req, res, next) => {
+const requireCustomerAuth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
 
@@ -446,6 +450,8 @@ const requireCustomerAuth = (req, res, next) => {
     if (decoded.role !== "customer") {
       return res.status(403).json({ status: false, message: "Customer access required." });
     }
+    const customer = await User.findOne({ _id: decoded.id, role: "customer", isActive: true }).select("_id").lean();
+    if (!customer) return res.status(403).json({ status: false, message: "This customer account is no longer active." });
 
     req.user = decoded;
     next();
@@ -459,7 +465,7 @@ const requireCustomerAuth = (req, res, next) => {
 
 app.use("/api", accountingRoutes(requireAdminAuth));
 
-const requireInstallerAuth = (req, res, next) => {
+const requireInstallerAuth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -469,6 +475,8 @@ const requireInstallerAuth = (req, res, next) => {
     if (decoded.role !== "installer") {
       return res.status(403).json({ status: false, message: "Installer access required." });
     }
+    const installer = await User.findOne({ _id: decoded.id, role: "installer", isActive: true }).select("_id").lean();
+    if (!installer) return res.status(403).json({ status: false, message: "This installer account is no longer active." });
     req.installer = decoded;
     next();
   } catch (error) {
@@ -476,7 +484,7 @@ const requireInstallerAuth = (req, res, next) => {
   }
 };
 
-const requireLearnerAuth = (req, res, next) => {
+const requireLearnerAuth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -486,6 +494,8 @@ const requireLearnerAuth = (req, res, next) => {
     if (decoded.role !== "learner") {
       return res.status(403).json({ status: false, message: "Learner access required." });
     }
+    const learner = await User.findOne({ _id: decoded.id, role: "learner", isActive: true }).select("_id").lean();
+    if (!learner) return res.status(403).json({ status: false, message: "This learner account is no longer active." });
     req.learner = decoded;
     next();
   } catch (error) {
