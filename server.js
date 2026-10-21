@@ -5088,6 +5088,8 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
+    release: "2026-10-21-live-sync-domain-links-v2",
+    portalUrl: frontendUrl(),
   });
 });
 app.post(

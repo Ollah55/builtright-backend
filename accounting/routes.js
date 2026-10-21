@@ -18,6 +18,18 @@ const validDay = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.t
 const dateAt = (day) => new Date(`${day}T12:00:00.000Z`);
 const tokenHash = (raw) => crypto.createHash("sha256").update(raw).digest("hex");
 const clean = (value, max = 200) => String(value || "").trim().slice(0, max);
+const productionFrontendUrl = "https://www.builtrightltd.com";
+const frontendUrl = () => {
+  const configuredUrl = clean(process.env.FRONTEND_URL, 500).replace(/\/+$/, "");
+  if (!configuredUrl) return productionFrontendUrl;
+  try {
+    return new URL(configuredUrl).hostname.toLowerCase().endsWith(".vercel.app")
+      ? productionFrontendUrl
+      : configuredUrl;
+  } catch {
+    return productionFrontendUrl;
+  }
+};
 const nullableDay = (value) => {
   if (value === null || value === undefined || value === "") return null;
   if (!validDay(value)) throw new Error("Enter a valid acquisition date.");
@@ -121,7 +133,7 @@ export function accountingRoutes(requireAdminAuth) {
       user.isActive = false;
       user.accountantProfile = { invitationTokenHash: tokenHash(raw), invitationExpiresAt: new Date(Date.now() + 7 * 86400000), invitedAt: new Date(), activatedAt: null };
       await user.save();
-      const link = `${process.env.FRONTEND_URL || "https://www.builtrightltd.com"}/accounting/activate?token=${raw}`;
+      const link = `${frontendUrl()}/accounting/activate?token=${raw}`;
       await sendEmail({ to: email, subject: "Activate your BuiltRight accountant account", html: `<h2>BuiltRight Accounting</h2><p>Hello ${fullName.replace(/[&<>"']/g, "")},</p><p>You have been invited to manage BuiltRight's accounting records. <a href="${link}">Set your password</a> within 7 days.</p>` });
       res.status(201).json({ status: true, message: "Accountant invitation sent.", accountant: userView(user) });
     } catch (error) {
@@ -155,7 +167,7 @@ export function accountingRoutes(requireAdminAuth) {
       user.accountantProfile.passwordResetExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
       user.accountantProfile.passwordResetSentAt = new Date();
       await user.save();
-      const link = `${process.env.FRONTEND_URL || "https://www.builtrightltd.com"}/accounting/reset-password?token=${encodeURIComponent(raw)}`;
+      const link = `${frontendUrl()}/accounting/reset-password?token=${encodeURIComponent(raw)}`;
       const safeName = user.fullName.replace(/[&<>"']/g, "");
       await sendEmail({
         to: user.email,
