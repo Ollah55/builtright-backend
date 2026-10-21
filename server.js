@@ -192,18 +192,34 @@ const createToken = (payload) => {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "7d" });
 };
 
-const frontendUrl = () => process.env.FRONTEND_URL || "https://www.builtrightltd.com";
+const productionFrontendUrl = "https://www.builtrightltd.com";
+
+const frontendUrl = () => {
+  const configuredUrl = String(process.env.FRONTEND_URL || "")
+    .trim()
+    .replace(/\/+$/, "");
+
+  if (!configuredUrl) return productionFrontendUrl;
+
+  try {
+    const hostname = new URL(configuredUrl).hostname.toLowerCase();
+    if (hostname.endsWith(".vercel.app")) {
+      console.warn("FRONTEND_URL points to Vercel; using the BuiltRight domain instead.");
+      return productionFrontendUrl;
+    }
+  } catch {
+    console.warn("FRONTEND_URL is invalid; using the BuiltRight domain instead.");
+    return productionFrontendUrl;
+  }
+
+  return configuredUrl;
+};
 
 const inspectionPaymentDetails = {
   bank: process.env.INSPECTION_PAYMENT_BANK || "FCMB",
   accountNumber: process.env.INSPECTION_PAYMENT_ACCOUNT || "2008839924",
   accountName: process.env.INSPECTION_PAYMENT_ACCOUNT_NAME || "BuiltRight Services Ltd",
 };
-
-const initialInstallers = [
-  { fullName: "Mr Taiwo Olanrewaju", email: "taiwo.olanrewaju@builtrightltd.com" },
-  { fullName: "Ms Anita Agary", email: "anita.agary@builtrightltd.com" },
-];
 
 const safeHtml = (value = "") => String(value)
   .replace(/&/g, "&amp;")
@@ -357,47 +373,10 @@ const makeSalesInvite = async ({ fullName, email, phone = "" }) => {
   return user;
 };
 
-const reissueInstallerInviteForDomain = async (user) => {
-  const rawToken = crypto.randomBytes(32).toString("hex");
-  user.installerProfile.invitationToken = rawToken;
-  user.installerProfile.invitationExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-  user.installerProfile.invitedAt = new Date();
-  user.installerProfile.invitationEmailSentAt = null;
-  await user.save();
-  if (await sendInstallerInviteEmail(user, rawToken)) {
-    user.installerProfile.domainLinkReissuedAt = new Date();
-    user.installerProfile.domainLinkReissueVersion = "custom-domain-v2";
-    await user.save();
-  }
-};
-
-const provisionInitialInstallers = async () => {
-  for (const installer of initialInstallers) {
-    const existing = await User.findOne({ email: installer.email });
-    if (!existing) {
-      await makeInstallerInvite(installer);
-    } else if (
-      existing.role === "installer" &&
-      existing.installerProfile?.domainLinkReissueVersion !== "custom-domain-v2"
-    ) {
-      await reissueInstallerInviteForDomain(existing);
-    } else if (
-      existing.role === "installer" &&
-      !existing.isActive &&
-      existing.installerProfile?.invitationToken &&
-      existing.installerProfile?.invitationExpiresAt > new Date() &&
-      !existing.installerProfile?.invitationEmailSentAt
-    ) {
-      await sendInstallerInviteEmail(existing, existing.installerProfile.invitationToken);
-    }
-  }
-};
-
 mongoose
   .connect(process.env.MONGODB_URI)
-  .then(async () => {
+  .then(() => {
     console.log("MongoDB connected");
-    await provisionInitialInstallers();
   })
   .catch((error) => console.error("MongoDB connection error:", error.message));
 
@@ -3217,7 +3196,7 @@ app.post("/api/loan-requests/:id/quotation/:documentId/send", requireOperationsA
     }
 
     const pdf = buildProjectDocumentPdf(quotation);
-    const portalUrl = `${process.env.FRONTEND_URL || "https://builtright-frontend.vercel.app"}/customer/documents`;
+    const portalUrl = `${frontendUrl()}/customer/documents`;
 
     try {
       await sendEmail({
@@ -3298,7 +3277,7 @@ app.post("/api/loan-requests/:id/documents/:documentId/send", requireOperationsA
 
     try {
       const pdf = buildProjectDocumentPdf(projectDocument);
-      const portalUrl = `${process.env.FRONTEND_URL || "https://builtright-frontend.vercel.app"}/customer/documents`;
+      const portalUrl = `${frontendUrl()}/customer/documents`;
       await sendEmail({
         to: projectDocument.customer.email,
         subject: `BuiltRight Project Invoice ${projectDocument.reference}`,
@@ -3809,7 +3788,7 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
     if (status === "disbursed" && createdInvoice && createdInvoice.emailDelivery?.status !== "sent") {
       try {
         const invoicePdf = buildProjectDocumentPdf(createdInvoice);
-        const portalUrl = `${process.env.FRONTEND_URL || "https://builtright-frontend.vercel.app"}/customer/documents`;
+        const portalUrl = `${frontendUrl()}/customer/documents`;
         await sendEmail({
           to: createdInvoice.customer.email,
           subject: `BuiltRight Project Invoice ${createdInvoice.reference}`,
