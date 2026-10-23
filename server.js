@@ -20,6 +20,7 @@ import DeviceAlert from "./models/DeviceAlert.js";
 import DeviceCommand from "./models/DeviceCommand.js";
 import ProjectDocument from "./models/ProjectDocument.js";
 import TrainingSettings from "./models/TrainingSettings.js";
+import AdminCredential from "./models/AdminCredential.js";
 import { accountingRoutes } from "./accounting/routes.js";
 import sendEmail from "./utils/sendEmail.js";
 import { builtRightEnergyLogoDataUri } from "./utils/invoiceBrandAssets.js";
@@ -228,6 +229,25 @@ const safeHtml = (value = "") => String(value)
   .replace(/>/g, "&gt;")
   .replace(/"/g, "&quot;")
   .replace(/'/g, "&#039;");
+
+const passwordResetTokenHash = (rawToken = "") =>
+  crypto.createHash("sha256").update(String(rawToken)).digest("hex");
+
+const passwordResetLoginPaths = {
+  customer: "/auth",
+  installer: "/installer/login",
+  learner: "/learner/login",
+  sales: "/sales/login",
+  accountant: "/accounting/login",
+};
+
+const passwordResetRoleLabels = {
+  customer: "customer",
+  installer: "installer",
+  learner: "learner",
+  sales: "sales team",
+  accountant: "accountant",
+};
 
 const formatNaira = (amount) => `₦${Number(amount || 0).toLocaleString("en-NG", { maximumFractionDigits: 0 })}`;
 
@@ -1781,14 +1801,75 @@ app.delete("/api/admin/products/:id", requireAdminAuth, async (req, res) => {
    ADMIN AUTH
 ========================= */
 
-app.post("/api/admin/login", (req, res) => {
+app.post("/api/admin/forgot-password", async (req, res) => {
+  const genericMessage = "If the email matches the BuiltRight administrator account, a secure reset link has been sent.";
+  try {
+    const email = String(req.body.email || "").toLowerCase().trim();
+    const configuredEmail = String(process.env.ADMIN_EMAIL || "").toLowerCase().trim();
+    if (email && configuredEmail && email === configuredEmail) {
+      const rawToken = crypto.randomBytes(32).toString("hex");
+      await AdminCredential.findOneAndUpdate(
+        { email: configuredEmail },
+        {
+          $set: {
+            passwordResetTokenHash: passwordResetTokenHash(rawToken),
+            passwordResetExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
+            passwordResetSentAt: new Date(),
+          },
+          $setOnInsert: { email: configuredEmail },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      const resetUrl = `${frontendUrl()}/admin/reset-password?token=${encodeURIComponent(rawToken)}`;
+      await sendEmail({
+        to: configuredEmail,
+        subject: "Reset your BuiltRight administrator password",
+        html: `<h2>BuiltRight Administration</h2><p>A password reset was requested for the BuiltRight administrator account.</p><p><a href="${resetUrl}">Set a new password</a> within one hour.</p><p>If you did not request this, you can ignore this email. Your current password remains active until the reset is completed.</p>`,
+      });
+    }
+    return res.json({ status: true, message: genericMessage });
+  } catch (error) {
+    console.error("ADMIN FORGOT PASSWORD ERROR:", error.message);
+    return res.json({ status: true, message: genericMessage });
+  }
+});
+
+app.post("/api/admin/reset-password", async (req, res) => {
+  try {
+    const rawToken = String(req.body.token || "").trim();
+    const password = String(req.body.password || "");
+    if (!/^[a-f0-9]{64}$/.test(rawToken) || password.length < 12) {
+      return res.status(400).json({ status: false, message: "Use a valid reset link and a password of at least 12 characters." });
+    }
+    const credential = await AdminCredential.findOne({
+      passwordResetTokenHash: passwordResetTokenHash(rawToken),
+      passwordResetExpiresAt: { $gt: new Date() },
+    });
+    if (!credential) return res.status(400).json({ status: false, message: "This password reset link is invalid or expired." });
+    credential.passwordHash = await bcrypt.hash(password, 12);
+    credential.passwordResetTokenHash = "";
+    credential.passwordResetExpiresAt = null;
+    await credential.save();
+    return res.json({ status: true, message: "Administrator password updated. You can now sign in." });
+  } catch (error) {
+    console.error("ADMIN RESET PASSWORD ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not reset the administrator password." });
+  }
+});
+
+app.post("/api/admin/login", async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = String(email || "").toLowerCase().trim();
+    const configuredEmail = String(process.env.ADMIN_EMAIL || "").toLowerCase().trim();
+    const credential = normalizedEmail === configuredEmail
+      ? await AdminCredential.findOne({ email: configuredEmail })
+      : null;
+    const passwordMatches = credential?.passwordHash
+      ? await bcrypt.compare(String(password || ""), credential.passwordHash)
+      : String(password || "") === String(process.env.ADMIN_PASSWORD || "");
 
-    if (
-      email !== process.env.ADMIN_EMAIL ||
-      password !== process.env.ADMIN_PASSWORD
-    ) {
+    if (normalizedEmail !== configuredEmail || !passwordMatches) {
       return res.status(401).json({
         status: false,
         message: "Invalid admin credentials.",
@@ -1796,7 +1877,7 @@ app.post("/api/admin/login", (req, res) => {
     }
 
     const token = createToken({
-      email,
+      email: normalizedEmail,
       role: "admin",
     });
 
@@ -1818,6 +1899,67 @@ app.post("/api/admin/login", (req, res) => {
 /* =========================
    CUSTOMER AUTH
 ========================= */
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const genericMessage = "If an active account matches those details, a secure reset link has been sent.";
+  try {
+    const email = String(req.body.email || "").toLowerCase().trim();
+    const requestedRole = String(req.body.role || "").toLowerCase().trim();
+    const allowedRoles = Object.keys(passwordResetLoginPaths);
+    const query = { email, isActive: true };
+    if (allowedRoles.includes(requestedRole)) query.role = requestedRole;
+    const user = email ? await User.findOne(query) : null;
+    if (user && allowedRoles.includes(user.role)) {
+      const rawToken = crypto.randomBytes(32).toString("hex");
+      user.passwordResetTokenHash = passwordResetTokenHash(rawToken);
+      user.passwordResetExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      user.passwordResetSentAt = new Date();
+      await user.save();
+      const resetUrl = `${frontendUrl()}/reset-password?token=${encodeURIComponent(rawToken)}`;
+      await sendEmail({
+        to: user.email,
+        subject: "Reset your BuiltRight password",
+        html: `<h2>BuiltRight Password Reset</h2><p>Hello ${safeHtml(user.fullName)},</p><p>A password reset was requested for your BuiltRight ${passwordResetRoleLabels[user.role]} account.</p><p><a href="${resetUrl}">Set a new password</a> within one hour.</p><p>If you did not request this, you can ignore this email. Your current password remains active until the reset is completed.</p>`,
+      });
+    }
+    return res.json({ status: true, message: genericMessage });
+  } catch (error) {
+    console.error("FORGOT PASSWORD ERROR:", error.message);
+    return res.json({ status: true, message: genericMessage });
+  }
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const rawToken = String(req.body.token || "").trim();
+    const password = String(req.body.password || "");
+    if (!/^[a-f0-9]{64}$/.test(rawToken)) {
+      return res.status(400).json({ status: false, message: "This password reset link is invalid or expired." });
+    }
+    const user = await User.findOne({
+      isActive: true,
+      passwordResetTokenHash: passwordResetTokenHash(rawToken),
+      passwordResetExpiresAt: { $gt: new Date() },
+    });
+    if (!user) return res.status(400).json({ status: false, message: "This password reset link is invalid or expired." });
+    const minimumLength = user.role === "accountant" ? 12 : 8;
+    if (password.length < minimumLength) {
+      return res.status(400).json({ status: false, message: `Use a password of at least ${minimumLength} characters.` });
+    }
+    user.password = await bcrypt.hash(password, 12);
+    user.passwordResetTokenHash = "";
+    user.passwordResetExpiresAt = null;
+    await user.save();
+    return res.json({
+      status: true,
+      message: "Password updated. You can now sign in.",
+      loginPath: passwordResetLoginPaths[user.role] || "/auth",
+    });
+  } catch (error) {
+    console.error("RESET PASSWORD ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not reset the password." });
+  }
+});
 
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -5794,7 +5936,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-10-23-richgreen-application-invoice-workflow-v1",
+    release: "2026-10-23-password-visibility-and-recovery-v2",
     portalUrl: frontendUrl(),
   });
 });
