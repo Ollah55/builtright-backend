@@ -378,6 +378,21 @@ const loanRequestSchema = new mongoose.Schema(
       },
       quotationSharedAt: { type: Date, default: null },
       customerApprovedAt: { type: Date, default: null },
+      richGreenApplication: {
+        status: {
+          type: String,
+          enum: ["not-started", "ready", "submitted"],
+          default: "not-started",
+        },
+        submittedAt: { type: Date, default: null },
+        submittedBy: { type: String, default: "", trim: true },
+        quotationDocument: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "ProjectDocument",
+          default: null,
+        },
+        data: { type: mongoose.Schema.Types.Mixed, default: null },
+      },
     },
 
     deposit: {

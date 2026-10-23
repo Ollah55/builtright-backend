@@ -60,6 +60,12 @@ const projectDocumentSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    purpose: {
+      type: String,
+      enum: ["project", "inspection-fee"],
+      default: "project",
+      index: true,
+    },
     version: { type: Number, default: 1, min: 1 },
     status: {
       type: String,

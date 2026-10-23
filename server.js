@@ -22,6 +22,7 @@ import ProjectDocument from "./models/ProjectDocument.js";
 import TrainingSettings from "./models/TrainingSettings.js";
 import { accountingRoutes } from "./accounting/routes.js";
 import sendEmail from "./utils/sendEmail.js";
+import { builtRightEnergyLogoDataUri } from "./utils/invoiceBrandAssets.js";
 
 dotenv.config();
 
@@ -1023,7 +1024,199 @@ const escapeHtml = (value = "") =>
 const formatDocumentMoney = (value) =>
   `NGN ${Number(value || 0).toLocaleString("en-NG")}`;
 
+const numberToEnglishWords = (value) => {
+  const number = Math.round(Number(value || 0));
+  if (!Number.isFinite(number) || number < 0) return "Zero Naira Only";
+  if (number === 0) return "Zero Naira Only";
+  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const underThousand = (n) => {
+    const words = [];
+    if (n >= 100) {
+      words.push(`${ones[Math.floor(n / 100)]} Hundred`);
+      n %= 100;
+    }
+    if (n >= 20) {
+      words.push(tens[Math.floor(n / 10)]);
+      if (n % 10) words.push(ones[n % 10]);
+    } else if (n > 0) words.push(ones[n]);
+    return words.join(" ");
+  };
+  const groups = [[1_000_000_000, "Billion"], [1_000_000, "Million"], [1_000, "Thousand"]];
+  let remaining = number;
+  const words = [];
+  groups.forEach(([size, label]) => {
+    if (remaining >= size) {
+      words.push(`${underThousand(Math.floor(remaining / size))} ${label}`);
+      remaining %= size;
+    }
+  });
+  if (remaining) words.push(underThousand(remaining));
+  return `${words.join(", ")} Naira Only`;
+};
+
+const buildInvoiceDocumentPdf = (projectDocument) => {
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  const green = [92, 159, 147];
+  const dark = [55, 58, 57];
+  const border = [83, 151, 222];
+  const left = 10;
+  const right = 200;
+  const fullWidth = right - left;
+  const money = (value) => Number(value || 0).toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const invoiceLabel = projectDocument.purpose === "inspection-fee" ? "INSPECTION INVOICE" : "INVOICE";
+  const date = new Date(projectDocument.createdAt || Date.now());
+
+  try { doc.addImage(builtRightEnergyLogoDataUri, "PNG", 14, 13, 48, 27); } catch (logoError) { console.error("INVOICE PDF LOGO ERROR:", logoError.message); }
+  doc.setTextColor(...green);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(projectDocument.purpose === "inspection-fee" ? 21 : 27);
+  doc.text(invoiceLabel, 196, 22, { align: "right" });
+  doc.setFontSize(15);
+  doc.text(projectDocument.reference, 196, 31, { align: "right" });
+  doc.setFontSize(10);
+  doc.text(`Invoice Date: ${date.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}`, 196, 42, { align: "right" });
+
+  let y = 52;
+  doc.setFontSize(10);
+  doc.text(String(date.getFullYear()), 12, y);
+  y += 10;
+  const panelTop = y;
+  const panelHeight = 47;
+  const half = fullWidth / 2;
+  doc.setFillColor(...green);
+  doc.rect(left, panelTop, half, 8, "F");
+  doc.rect(left + half, panelTop, half, 8, "F");
+  doc.setTextColor(...dark);
+  doc.setFontSize(9);
+  doc.text("Bill to", left + 3, panelTop + 5.4);
+  doc.text("Payment Details", left + half + 3, panelTop + 5.4);
+  doc.setDrawColor(...border);
+  doc.setLineWidth(0.2);
+  doc.rect(left, panelTop, fullWidth, panelHeight);
+  doc.line(left + half, panelTop, left + half, panelTop + panelHeight);
+  const billRows = [
+    ["Customer", projectDocument.customer?.fullName || "Customer"],
+    ["Customer ID#", String(projectDocument.financingRequest || "").slice(-8).toUpperCase()],
+    ["System Size", projectDocument.project?.systemCapacity || projectDocument.project?.systemName || "To be confirmed"],
+    ["Address", projectDocument.project?.siteAddress || projectDocument.customer?.location || ""],
+    ["Phone", projectDocument.customer?.phone || ""],
+    ["Email", projectDocument.customer?.email || ""],
+  ];
+  const paymentRows = [
+    ["Bank Name", inspectionPaymentDetails.bank],
+    ["Account Name", inspectionPaymentDetails.accountName],
+    ["Account Number", inspectionPaymentDetails.accountNumber],
+  ];
+  const drawDetailRows = (rows, x, valueX) => {
+    let rowY = panelTop + 14;
+    rows.forEach(([label, value]) => {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8.2);
+      doc.text(label, x, rowY);
+      doc.setFont("helvetica", "normal");
+      const lines = doc.splitTextToSize(String(value || "Nil"), 48);
+      doc.text(lines.slice(0, 2), valueX, rowY);
+      rowY += Math.max(5.5, lines.slice(0, 2).length * 4);
+    });
+  };
+  drawDetailRows(billRows, left + 3, left + 40);
+  drawDetailRows(paymentRows, left + half + 3, left + half + 33);
+
+  y = panelTop + panelHeight + 8;
+  const columns = [11, 23, 137, 149, 173, 200];
+  const drawItemHeader = () => {
+    doc.setFillColor(...green);
+    doc.rect(left, y, fullWidth, 8, "F");
+    doc.setTextColor(...dark);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8.5);
+    doc.text("S/N", 15, y + 5.4, { align: "center" });
+    doc.text("Description", 80, y + 5.4, { align: "center" });
+    doc.text("QTY", 143, y + 5.4, { align: "center" });
+    doc.text("Unit price", 161, y + 5.4, { align: "center" });
+    doc.text("Amount", 186, y + 5.4, { align: "center" });
+    y += 8;
+  };
+  drawItemHeader();
+  (projectDocument.lineItems || []).forEach((item, index) => {
+    const descriptionLines = doc.splitTextToSize(String(item.description || "Item"), 108);
+    const rowHeight = Math.max(8, descriptionLines.length * 4.3 + 3);
+    if (y + rowHeight > 235) {
+      doc.addPage();
+      y = 18;
+      drawItemHeader();
+    }
+    doc.setDrawColor(...border);
+    doc.rect(left, y, fullWidth, rowHeight);
+    columns.slice(1, -1).forEach((x) => doc.line(x, y, x, y + rowHeight));
+    doc.setTextColor(...dark);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8.2);
+    doc.text(String(index + 1), 15, y + 5.3, { align: "center" });
+    doc.text(descriptionLines, 25, y + 5.3);
+    doc.text(String(item.quantity ?? 1), 143, y + 5.3, { align: "center" });
+    doc.text(money(item.unitPrice), 171, y + 5.3, { align: "right" });
+    doc.text(money(item.amount), 198, y + 5.3, { align: "right" });
+    y += rowHeight;
+  });
+
+  if (y > 225) {
+    doc.addPage();
+    y = 25;
+  } else y += 5;
+  const totalsX = 104;
+  const totalsWidth = 92;
+  const totalRows = [
+    ["SUBTOTAL", projectDocument.subtotal, true],
+    ...(Number(projectDocument.discount || 0) > 0 ? [["Discount", -Number(projectDocument.discount), false]] : []),
+    ...(Number(projectDocument.tax || 0) > 0 ? [["VAT / Tax", projectDocument.tax, false]] : []),
+    ["GRAND TOTAL", projectDocument.total, true],
+  ];
+  totalRows.forEach(([label, value, emphasized]) => {
+    if (emphasized) {
+      doc.setFillColor(...green);
+      doc.rect(totalsX, y, totalsWidth, 8, "F");
+    } else {
+      doc.setDrawColor(40, 40, 40);
+      doc.rect(totalsX, y, totalsWidth, 8);
+    }
+    doc.setTextColor(...dark);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8.5);
+    doc.text(label, totalsX + 3, y + 5.4);
+    doc.text(money(value), totalsX + totalsWidth - 3, y + 5.4, { align: "right" });
+    y += 8;
+  });
+  const words = numberToEnglishWords(projectDocument.total);
+  const wordLines = doc.splitTextToSize(`Amount in Words: ${words}`, totalsWidth - 7);
+  const wordsHeight = Math.max(14, wordLines.length * 4 + 5);
+  doc.setDrawColor(40, 40, 40);
+  doc.rect(totalsX, y, totalsWidth, wordsHeight);
+  doc.setFont("helvetica", "bolditalic");
+  doc.setFontSize(8.2);
+  doc.text(wordLines, totalsX + 3, y + 5.5);
+  y += wordsHeight + 4;
+
+  doc.setTextColor(235, 65, 35);
+  doc.setFont("helvetica", "bolditalic");
+  doc.setFontSize(8.5);
+  const validity = projectDocument.purpose === "inspection-fee"
+    ? "Please note: This invoice covers the site inspection and assessment fee only."
+    : "Please note: This invoice stays valid for a maximum of 2 weeks after submission.";
+  doc.text(doc.splitTextToSize(validity, 120), 13, Math.min(y, 263));
+
+  doc.setTextColor(...green);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(8.5);
+  doc.text("Contact for more info: 0904 999 1595 | info@builtrightltd.com | www.builtrightltd.com", 105, 282, { align: "center" });
+  doc.setFont("helvetica", "bolditalic");
+  doc.text("Thank you for your business!!!", 105, 287, { align: "center" });
+  return Buffer.from(doc.output("arraybuffer"));
+};
+
 const buildProjectDocumentPdf = (projectDocument) => {
+  if (projectDocument.type === "invoice") return buildInvoiceDocumentPdf(projectDocument);
   const doc = new jsPDF({ unit: "mm", format: "a4" });
   const margin = 18;
   const usableWidth = 174;
@@ -1045,6 +1238,11 @@ const buildProjectDocumentPdf = (projectDocument) => {
 
   doc.setFillColor(15, 79, 72);
   doc.rect(0, 0, 210, 38, "F");
+  try {
+    doc.addImage(builtRightEnergyLogoDataUri, "PNG", 166, 5, 27, 27);
+  } catch (logoError) {
+    console.error("PDF LOGO ERROR:", logoError.message);
+  }
   doc.setTextColor(255, 255, 255);
   doc.setFontSize(19);
   doc.setFont("helvetica", "bold");
@@ -1052,7 +1250,9 @@ const buildProjectDocumentPdf = (projectDocument) => {
   doc.setFontSize(10);
   doc.setFont("helvetica", "normal");
   doc.text(
-    projectDocument.type === "invoice" ? "PROJECT INVOICE" : "SOLAR PROJECT QUOTATION",
+    projectDocument.type === "invoice"
+      ? (projectDocument.purpose === "inspection-fee" ? "SITE INSPECTION FEE INVOICE" : "PROJECT INVOICE")
+      : "SOLAR PROJECT QUOTATION",
     margin,
     29
   );
@@ -1094,7 +1294,7 @@ const buildProjectDocumentPdf = (projectDocument) => {
   doc.setFillColor(237, 246, 243);
   doc.rect(margin, y, usableWidth, 8, "F");
   doc.setFont("helvetica", "bold");
-  doc.text("PROJECT COST BREAKDOWN", margin + 3, y + 5.4);
+  doc.text(projectDocument.purpose === "inspection-fee" ? "ASSESSMENT FEE BREAKDOWN" : "PROJECT COST BREAKDOWN", margin + 3, y + 5.4);
   y += 13;
 
   (projectDocument.lineItems || []).forEach((item, index) => {
@@ -1175,6 +1375,219 @@ const buildProjectDocumentPdf = (projectDocument) => {
     4
   );
 
+  return Buffer.from(doc.output("arraybuffer"));
+};
+
+const createInspectionFeeInvoice = async (loanRequest) => {
+  const amount = Number(loanRequest.inspection?.feeAmount || 0);
+  if (!(amount > 0)) return null;
+  const reference = `BRI-${String(loanRequest.reference || loanRequest._id).replace(/[^A-Z0-9-]/gi, "").toUpperCase()}`;
+  const order = await Order.findOne({ financingRequestId: loanRequest._id }).select("_id").lean();
+  const payload = {
+    reference,
+    financingRequest: loanRequest._id,
+    order: order?._id || null,
+    type: "invoice",
+    purpose: "inspection-fee",
+    version: 1,
+    status: "issued",
+    title: "Site inspection, load audit and due-diligence assessment fee",
+    customer: {
+      fullName: loanRequest.customer?.fullName,
+      email: loanRequest.customer?.email,
+      phone: loanRequest.customer?.phone,
+      location: loanRequest.customer?.location,
+    },
+    project: {
+      systemName: loanRequest.items?.[0]?.name || "Solar system assessment",
+      systemCapacity: loanRequest.items?.[0]?.capacity || "To be confirmed after assessment",
+      siteAddress: loanRequest.customer?.location || "",
+      scope: "On-site inspection, verified load audit, technical suitability checks, due diligence and installation-material assessment.",
+    },
+    lineItems: [{
+      category: "installation-service",
+      description: "Site inspection, load audit and due-diligence assessment fee",
+      quantity: 1,
+      unit: "service",
+      unitPrice: amount,
+      amount,
+      source: "confirmed",
+    }],
+    subtotal: amount,
+    total: amount,
+    equityPercentage: 100,
+    equityAmount: amount,
+    bankFinanceAmount: 0,
+    terms: `Pay to ${inspectionPaymentDetails.bank}, account ${inspectionPaymentDetails.accountNumber}, ${inspectionPaymentDetails.accountName}. Upload proof of payment in your BuiltRight customer profile for sales confirmation.`,
+    notes: "This invoice covers the pre-installation site assessment only. The final system, installation materials and full project cost will be confirmed after assessment.",
+    sentAt: new Date(),
+    emailDelivery: { status: "not-sent" },
+    createdBy: "BuiltRight sales operations",
+  };
+  return ProjectDocument.findOneAndUpdate(
+    { financingRequest: loanRequest._id, type: "invoice", purpose: "inspection-fee" },
+    { $set: payload },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+};
+
+const applicationEncryptionKey = () => {
+  const secret = process.env.APPLICATION_DATA_ENCRYPTION_KEY || process.env.JWT_SECRET || "";
+  if (!secret) throw new Error("Application-data encryption is not configured.");
+  return crypto.createHash("sha256").update(secret).digest();
+};
+
+const encryptApplicationData = (data) => {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", applicationEncryptionKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(data), "utf8"), cipher.final()]);
+  return {
+    encrypted: true,
+    algorithm: "aes-256-gcm",
+    iv: iv.toString("base64"),
+    authTag: cipher.getAuthTag().toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+  };
+};
+
+const decryptApplicationData = (stored) => {
+  if (!stored?.encrypted) return stored || {};
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    applicationEncryptionKey(),
+    Buffer.from(stored.iv, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(stored.authTag, "base64"));
+  return JSON.parse(Buffer.concat([
+    decipher.update(Buffer.from(stored.ciphertext, "base64")),
+    decipher.final(),
+  ]).toString("utf8"));
+};
+
+const buildRichGreenApplicationPdf = (loanRequest, quotation) => {
+  const application = decryptApplicationData(loanRequest.bankApplication?.richGreenApplication?.data);
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  const margin = 16;
+  const width = 178;
+  let y = 17;
+  const ensureRoom = (height = 12) => {
+    if (y + height > 280) {
+      doc.addPage();
+      y = 18;
+    }
+  };
+  const text = (value) => String(value ?? "").trim() || "Not provided";
+  const section = (title) => {
+    ensureRoom(14);
+    doc.setFillColor(21, 146, 132);
+    doc.rect(margin, y, width, 8, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.text(title, margin + 3, y + 5.5);
+    y += 12;
+    doc.setTextColor(28, 42, 38);
+  };
+  const row = (label, value) => {
+    const lines = doc.splitTextToSize(`${label}: ${text(value)}`, width - 4);
+    ensureRoom(lines.length * 4.5 + 2);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8.5);
+    doc.text(lines, margin + 2, y);
+    y += lines.length * 4.5 + 1.5;
+  };
+
+  doc.setFillColor(179, 33, 39);
+  doc.rect(0, 0, 210, 40, "F");
+  try { doc.addImage(builtRightEnergyLogoDataUri, "PNG", 166, 5, 27, 27); } catch (logoError) { console.error("APPLICATION PDF LOGO ERROR:", logoError.message); }
+  doc.setTextColor(255, 255, 255);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(14);
+  doc.text("BUILTRIGHT SOLAR FINANCING SCHEME", margin, 16);
+  doc.setFontSize(10);
+  doc.text("Powered by RichGreen Master's Investment Limited", margin, 24);
+  doc.setFont("helvetica", "normal");
+  doc.text("Customer Application Form", margin, 32);
+  y = 49;
+
+  section("APPLICANT INFORMATION");
+  row("Full name", application.fullName);
+  row("Date of birth", application.dateOfBirth);
+  row("Gender", application.gender);
+  row("Marital status", application.maritalStatus);
+  row("Phone number", application.phoneNumber);
+  row("Email address", application.emailAddress);
+  row("Residential address", application.residentialAddress);
+  row("State", application.state);
+  row("LGA", application.lga);
+  row("BVN", application.bvn);
+  row("National Identification Number", application.nin);
+
+  section("IDENTIFICATION");
+  row("Type of identification", application.identificationType);
+  row("ID number", application.identificationNumber);
+  row("Expiry date", application.identificationExpiryDate);
+
+  section("EMPLOYMENT OR BUSINESS DETAILS");
+  row("Employment status", application.employmentStatus);
+  row("Employer or business name", application.employerBusinessName);
+  row("Office or business address", application.officeBusinessAddress);
+  row("Position or business type", application.positionBusinessType);
+  row("Monthly net income", formatDocumentMoney(application.monthlyNetIncome));
+  row("Years in employment or business", application.yearsInEmploymentBusiness);
+
+  section("BANK DETAILS");
+  row("Bank name", application.bankName);
+  row("Account number", application.accountNumber);
+  row("Account name", application.accountName);
+  row("Preferred repayment method", application.preferredRepaymentMethod);
+
+  section("SOLAR OR INVERTER REQUIREMENT");
+  row("Package selected", application.packageSelected || quotation?.project?.systemName);
+  row("System capacity", application.systemCapacity || quotation?.project?.systemCapacity);
+  row("Quotation amount", formatDocumentMoney(quotation?.total));
+  row(`Customer equity contribution (${Number(quotation?.equityPercentage || 20)}%)`, formatDocumentMoney(quotation?.equityAmount));
+  row("Finance required", formatDocumentMoney(quotation?.bankFinanceAmount));
+  row("Preferred repayment tenor", `${application.preferredRepaymentTenor || ""} months`);
+  row("Installation address", application.installationAddress || quotation?.project?.siteAddress);
+
+  section("GUARANTOR DETAILS FOR BUSINESS OWNER");
+  row("Guarantor name", application.guarantorName);
+  row("Phone number", application.guarantorPhoneNumber);
+  row("Occupation", application.guarantorOccupation);
+  row("Residential address", application.guarantorResidentialAddress);
+  row("Relationship to applicant", application.guarantorRelationship);
+
+  section("CUSTOMER DECLARATION");
+  row("Declaration", "The applicant confirms that the information supplied is true and complete, accepts the equity and repayment obligations in the application form, authorizes account debit and payment to BuiltRight, and acknowledges the financed-equipment ownership and default-protection terms stated in the RichGreen application.");
+  row("Applicant's name", application.applicantName);
+  row("Electronic signature", application.electronicSignature);
+  row("Submission date", new Date(loanRequest.bankApplication?.richGreenApplication?.submittedAt || Date.now()).toLocaleDateString("en-GB"));
+
+  section("FOR BUILTRIGHT ENERGY USE");
+  row("Site inspection completed", loanRequest.assessment?.inspection?.status === "completed" ? "Yes" : "No");
+  row("Load assessment completed", loanRequest.assessment?.loadAudit?.status === "completed" ? "Yes" : "No");
+  row("Proforma invoice attached", quotation ? `Yes - ${quotation.reference}` : "No");
+  row("Installer's name", loanRequest.installerAssignment?.installerName);
+
+  section("FOR RICHGREEN MASTER'S INVESTMENT LIMITED USE");
+  row("Application received by", "");
+  row("Credit assessment", "Pending bank review");
+  row("Approved amount", "");
+  row("Tenor", "");
+  row("Interest rate", "5% monthly reducing balance");
+  row("Approval officer", "");
+
+  ensureRoom(16);
+  y += 5;
+  doc.setDrawColor(21, 146, 132);
+  doc.line(margin, y, margin + width, y);
+  y += 6;
+  doc.setTextColor(80, 91, 87);
+  doc.setFontSize(7.5);
+  doc.text(`BuiltRight reference: ${loanRequest.reference} | Quotation: ${quotation?.reference || "Not available"}`, margin, y);
+  y += 4;
+  doc.text("BuiltRight Services Ltd | 1B Adeniji Street, Off Odusami Street, Ogba, Ikeja, Lagos", margin, y);
   return Buffer.from(doc.output("arraybuffer"));
 };
 
@@ -2440,15 +2853,33 @@ app.get("/api/sales/projects", requireOperationsAuth, async (req, res) => {
     ]);
     const ordersByProject = new Map(orders.map((order) => [String(order.financingRequestId), order]));
     const invoicesByProject = new Map();
+    const inspectionInvoicesByProject = new Map();
     invoices.forEach((invoice) => {
       const key = String(invoice.financingRequest);
-      if (!invoicesByProject.has(key)) invoicesByProject.set(key, invoice);
+      if (invoice.purpose === "inspection-fee") {
+        if (!inspectionInvoicesByProject.has(key)) inspectionInvoicesByProject.set(key, invoice);
+      } else if (!invoicesByProject.has(key)) {
+        invoicesByProject.set(key, invoice);
+      }
     });
-    const customers = projects.map((project) => ({
-      ...project,
-      order: ordersByProject.get(String(project._id)) || null,
-      invoice: invoicesByProject.get(String(project._id)) || null,
-    }));
+    const customers = projects.map((project) => {
+      const richGreenApplication = project.bankApplication?.richGreenApplication;
+      return {
+        ...project,
+        bankApplication: {
+          ...project.bankApplication,
+          richGreenApplication: richGreenApplication ? {
+            status: richGreenApplication.status,
+            submittedAt: richGreenApplication.submittedAt,
+            submittedBy: richGreenApplication.submittedBy,
+            quotationDocument: richGreenApplication.quotationDocument,
+          } : null,
+        },
+        order: ordersByProject.get(String(project._id)) || null,
+        invoice: invoicesByProject.get(String(project._id)) || null,
+        inspectionInvoice: inspectionInvoicesByProject.get(String(project._id)) || null,
+      };
+    });
     return res.json({ status: true, customers });
   } catch (error) {
     console.error("SALES CUSTOMER LIST ERROR:", error.message);
@@ -2648,6 +3079,26 @@ app.patch("/api/sales/projects/:id/installer", requireOperationsAuth, async (req
   } catch (error) {
     console.error("MANUAL SALES ASSIGNMENT ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not assign the installer." });
+  }
+});
+
+app.get("/api/sales/projects/:id/richgreen-application/download", requireOperationsAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findById(req.params.id);
+    if (!loanRequest) return res.status(404).json({ status: false, message: "Customer project not found." });
+    if (loanRequest.bankApplication?.richGreenApplication?.status !== "submitted") {
+      return res.status(409).json({ status: false, message: "The customer has not submitted the RichGreen application." });
+    }
+    const quotation = await ProjectDocument.findOne({ financingRequest: loanRequest._id, type: "quotation", status: "approved" }).sort({ version: -1 });
+    if (!quotation) return res.status(409).json({ status: false, message: "The approved quotation is not available." });
+    const pdf = buildRichGreenApplicationPdf(loanRequest, quotation);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="RichGreen-Application-${loanRequest.reference}.pdf"`);
+    res.setHeader("Cache-Control", "no-store");
+    return res.send(pdf);
+  } catch (error) {
+    console.error("DOWNLOAD RICHGREEN APPLICATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not download the RichGreen application." });
   }
 });
 
@@ -2898,14 +3349,34 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
     loanRequest.status = "inspection-scheduled";
     loanRequest.statusHistory.push({ status: "inspection-scheduled", source: "installer", note: `Inspection scheduled by ${loanRequest.installerAssignment.installerName}.` });
     await loanRequest.save();
+    let inspectionInvoice = null;
     try {
+      inspectionInvoice = await createInspectionFeeInvoice(loanRequest);
+    } catch (invoiceError) {
+      console.error("INSPECTION INVOICE ERROR:", invoiceError.message);
+    }
+    try {
+      const attachments = inspectionInvoice ? [{
+        filename: `BuiltRight-Inspection-Invoice-${inspectionInvoice.reference}.pdf`,
+        content: buildProjectDocumentPdf(inspectionInvoice),
+        contentType: "application/pdf",
+      }] : [];
       await sendEmail({
         to: loanRequest.customer.email,
         subject: `BuiltRight inspection scheduled - ${loanRequest.reference}`,
-        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(normalizedLocation)}</li><li><strong>Inspection fee:</strong> ${formatNaira(normalizedFee)}</li></ul><p>Please make the inspection-fee payment using the details below. Then sign in to your BuiltRight customer profile, upload your payment proof, and click <strong>I have paid — submit proof</strong>. Your installer can begin the inspection only after confirming receipt.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul><p><a href="${frontendUrl()}/customer/financing">Open customer profile</a></p>`,
+        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(normalizedLocation)}</li><li><strong>Inspection fee:</strong> ${formatNaira(normalizedFee)}</li></ul><p>Your branded inspection-fee invoice is attached and is also available in your BuiltRight customer profile.</p><p>Please make the inspection-fee payment using the details below. Then sign in to your BuiltRight customer profile, upload your payment proof, and click <strong>I have paid — submit proof</strong>. Your installer can begin the inspection only after sales confirms receipt.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul><p><a href="${frontendUrl()}/customer/financing">Open customer profile</a></p>`,
+        attachments,
       });
+      if (inspectionInvoice) {
+        inspectionInvoice.emailDelivery = { status: "sent", sentAt: new Date(), error: "" };
+        await inspectionInvoice.save();
+      }
     } catch (mailError) {
       console.error("INSPECTION SCHEDULE EMAIL ERROR:", mailError.message);
+      if (inspectionInvoice) {
+        inspectionInvoice.emailDelivery = { status: "failed", sentAt: null, error: mailError.message };
+        await inspectionInvoice.save();
+      }
     }
     try {
       await sendSms({
@@ -4907,9 +5378,20 @@ app.get("/api/customer/documents", requireCustomerAuth, async (req, res) => {
 
     const financingIds = [...new Set(documents.map((document) => String(document.financingRequest)))];
     const financingRequests = await LoanRequest.find({ _id: { $in: financingIds } })
-      .select("reference status quotation bankApplication deposit finalProjectCost paymentMethod installationProvider productSource")
+      .select("reference status quotation bankApplication deposit finalProjectCost paymentMethod installationProvider productSource financeInstitution assessment installerAssignment")
       .lean();
-    const financingById = new Map(financingRequests.map((item) => [String(item._id), item]));
+    const financingById = new Map(financingRequests.map((item) => [String(item._id), {
+      ...item,
+      bankApplication: {
+        ...item.bankApplication,
+        richGreenApplication: item.bankApplication?.richGreenApplication ? {
+          status: item.bankApplication.richGreenApplication.status,
+          submittedAt: item.bankApplication.richGreenApplication.submittedAt,
+          submittedBy: item.bankApplication.richGreenApplication.submittedBy,
+          quotationDocument: item.bankApplication.richGreenApplication.quotationDocument,
+        } : null,
+      },
+    }]));
 
     return res.json({
       status: true,
@@ -4981,10 +5463,11 @@ app.post("/api/customer/quotations/:id/approve", requireCustomerAuth, async (req
     loanRequest.quotation ||= {};
     loanRequest.bankApplication ||= {};
     const isOutright = loanRequest.paymentMethod === "outright";
+    const isRichGreen = !isOutright && /richgreen/i.test(String(loanRequest.financeInstitution || loanRequest.bankApplication?.provider || ""));
     const bankApplicationUrl = isOutright
       ? ""
-      : (loanRequest.bankApplication?.redirectUrl || process.env.BANK_APPLICATION_URL || "");
-    const bankApplicationEmail = isOutright ? "" : (process.env.BANK_APPLICATION_EMAIL || "");
+      : (isRichGreen ? "" : (loanRequest.bankApplication?.redirectUrl || process.env.BANK_APPLICATION_URL || ""));
+    const bankApplicationEmail = isOutright || isRichGreen ? "" : (process.env.BANK_APPLICATION_EMAIL || "");
     loanRequest.quotation.status = "approved";
     loanRequest.quotation.document = quotation._id;
     loanRequest.quotation.reference = quotation.reference;
@@ -4994,7 +5477,12 @@ app.post("/api/customer/quotations/:id/approve", requireCustomerAuth, async (req
     loanRequest.bankApplication.customerApprovedAt = approvedAt;
     loanRequest.bankApplication.status = isOutright
       ? "not-required"
-      : (bankApplicationUrl ? "ready-for-customer" : "awaiting-bank-link");
+      : (isRichGreen ? "manual-application-ready" : (bankApplicationUrl ? "ready-for-customer" : "awaiting-bank-link"));
+    if (isRichGreen) {
+      loanRequest.bankApplication.richGreenApplication ||= {};
+      loanRequest.bankApplication.richGreenApplication.status = "ready";
+      loanRequest.bankApplication.richGreenApplication.quotationDocument = quotation._id;
+    }
     loanRequest.status = "quotation-approved";
     loanRequest.statusHistory.push({
       status: "quotation-approved",
@@ -5047,19 +5535,121 @@ app.post("/api/customer/quotations/:id/approve", requireCustomerAuth, async (req
       status: true,
       message: isOutright
         ? "Quotation approved. BuiltRight will issue your final outright-payment invoice."
+        : (isRichGreen
+          ? "Quotation approved. Complete the RichGreen credit application form now."
         : (bankApplicationUrl
           ? "Quotation approved. Your bank credit application is now available."
-          : "Quotation approved. BuiltRight is awaiting the bank's hosted application link."),
+          : "Quotation approved. BuiltRight is awaiting the bank's hosted application link.")),
       quotation,
       bankApplication: {
         ready: Boolean(bankApplicationUrl),
         url: bankApplicationUrl,
         status: loanRequest.bankApplication.status,
+        richGreenApplication: loanRequest.bankApplication.richGreenApplication,
       },
     });
   } catch (error) {
     console.error("APPROVE QUOTATION ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not approve the quotation." });
+  }
+});
+
+app.post("/api/customer/financing/:id/richgreen-application", requireCustomerAuth, async (req, res) => {
+  try {
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "customer.email": req.user.email });
+    if (!loanRequest) return res.status(404).json({ status: false, message: "Financing project not found." });
+    if (loanRequest.paymentMethod === "outright" || !/richgreen/i.test(String(loanRequest.financeInstitution || ""))) {
+      return res.status(409).json({ status: false, message: "The RichGreen application is not available for this project." });
+    }
+    const quotation = await ProjectDocument.findOne({ financingRequest: loanRequest._id, type: "quotation", status: "approved" }).sort({ version: -1 });
+    if (!quotation) return res.status(409).json({ status: false, message: "Approve the final quotation before completing the RichGreen application." });
+
+    const source = req.body || {};
+    const clean = (value) => String(value || "").trim();
+    const application = {
+      fullName: clean(source.fullName || loanRequest.customer?.fullName),
+      dateOfBirth: clean(source.dateOfBirth),
+      gender: clean(source.gender),
+      maritalStatus: clean(source.maritalStatus),
+      phoneNumber: clean(source.phoneNumber || loanRequest.customer?.phone),
+      emailAddress: clean(source.emailAddress || loanRequest.customer?.email).toLowerCase(),
+      residentialAddress: clean(source.residentialAddress),
+      state: clean(source.state),
+      lga: clean(source.lga),
+      bvn: clean(source.bvn).replace(/\D/g, ""),
+      nin: clean(source.nin).replace(/\D/g, ""),
+      identificationType: clean(source.identificationType),
+      identificationNumber: clean(source.identificationNumber),
+      identificationExpiryDate: clean(source.identificationExpiryDate),
+      employmentStatus: clean(source.employmentStatus),
+      employerBusinessName: clean(source.employerBusinessName),
+      officeBusinessAddress: clean(source.officeBusinessAddress),
+      positionBusinessType: clean(source.positionBusinessType),
+      monthlyNetIncome: Number(source.monthlyNetIncome || 0),
+      yearsInEmploymentBusiness: clean(source.yearsInEmploymentBusiness),
+      bankName: clean(source.bankName),
+      accountNumber: clean(source.accountNumber).replace(/\D/g, ""),
+      accountName: clean(source.accountName),
+      preferredRepaymentMethod: clean(source.preferredRepaymentMethod),
+      packageSelected: clean(source.packageSelected || quotation.project?.systemName),
+      systemCapacity: clean(source.systemCapacity || quotation.project?.systemCapacity),
+      preferredRepaymentTenor: Number(source.preferredRepaymentTenor || 0),
+      installationAddress: clean(source.installationAddress || quotation.project?.siteAddress || loanRequest.customer?.location),
+      guarantorName: clean(source.guarantorName),
+      guarantorPhoneNumber: clean(source.guarantorPhoneNumber),
+      guarantorOccupation: clean(source.guarantorOccupation),
+      guarantorResidentialAddress: clean(source.guarantorResidentialAddress),
+      guarantorRelationship: clean(source.guarantorRelationship),
+      applicantName: clean(source.applicantName),
+      electronicSignature: clean(source.electronicSignature),
+      declarationAccepted: Boolean(source.declarationAccepted),
+    };
+    const requiredFields = [
+      ["fullName", "full name"], ["dateOfBirth", "date of birth"], ["gender", "gender"], ["maritalStatus", "marital status"],
+      ["phoneNumber", "phone number"], ["emailAddress", "email address"], ["residentialAddress", "residential address"],
+      ["state", "state"], ["lga", "LGA"], ["bvn", "BVN"], ["identificationType", "identification type"],
+      ["identificationNumber", "identification number"], ["identificationExpiryDate", "identification expiry date"],
+      ["employmentStatus", "employment status"], ["employerBusinessName", "employer or business name"],
+      ["officeBusinessAddress", "office or business address"], ["positionBusinessType", "position or business type"],
+      ["yearsInEmploymentBusiness", "years in employment or business"], ["bankName", "bank name"],
+      ["accountNumber", "account number"], ["accountName", "account name"],
+      ["preferredRepaymentMethod", "preferred repayment method"], ["packageSelected", "package selected"],
+      ["systemCapacity", "system capacity"], ["installationAddress", "installation address"],
+      ["applicantName", "applicant name"], ["electronicSignature", "electronic signature"],
+    ];
+    const missing = requiredFields.find(([key]) => !application[key]);
+    if (missing) return res.status(400).json({ status: false, message: `Enter the applicant's ${missing[1]}.` });
+    if (!/^\d{11}$/.test(application.bvn)) return res.status(400).json({ status: false, message: "Enter a valid 11-digit BVN." });
+    if (application.nin && !/^\d{11}$/.test(application.nin)) return res.status(400).json({ status: false, message: "Enter a valid 11-digit NIN or leave it blank." });
+    if (!/^\d{10}$/.test(application.accountNumber)) return res.status(400).json({ status: false, message: "Enter a valid 10-digit bank account number." });
+    if (!(application.monthlyNetIncome > 0)) return res.status(400).json({ status: false, message: "Enter the applicant's monthly net income." });
+    if (![3, 4, 5, 6, 7].includes(application.preferredRepaymentTenor)) return res.status(400).json({ status: false, message: "Select a repayment tenor from 3 to 7 months." });
+    if (/business owner/i.test(application.employmentStatus)) {
+      const guarantorFields = ["guarantorName", "guarantorPhoneNumber", "guarantorOccupation", "guarantorResidentialAddress", "guarantorRelationship"];
+      if (guarantorFields.some((key) => !application[key])) return res.status(400).json({ status: false, message: "Complete all guarantor details for a business-owner application." });
+    }
+    if (!application.declarationAccepted) return res.status(400).json({ status: false, message: "Accept the customer declaration before submitting." });
+
+    const submittedAt = new Date();
+    loanRequest.bankApplication ||= {};
+    loanRequest.bankApplication.status = "manual-application-submitted";
+    loanRequest.bankApplication.richGreenApplication = {
+      status: "submitted",
+      submittedAt,
+      submittedBy: application.fullName,
+      quotationDocument: quotation._id,
+      data: encryptApplicationData(application),
+    };
+    loanRequest.statusHistory.push({ status: loanRequest.status, source: "customer", note: `Customer submitted the RichGreen application for quotation ${quotation.reference}.` });
+    await loanRequest.save();
+    return res.json({
+      status: true,
+      message: "RichGreen application submitted securely. The sales team can now download it from the portal and forward it to the bank with your approved quotation.",
+      richGreenApplication: { status: "submitted", submittedAt, submittedBy: application.fullName, quotationDocument: quotation._id },
+    });
+  } catch (error) {
+    console.error("SUBMIT RICHGREEN APPLICATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: error.message === "Application-data encryption is not configured." ? "Secure application storage is not configured. Contact BuiltRight support." : "Could not submit the RichGreen application." });
   }
 });
 
@@ -5089,26 +5679,41 @@ app.post("/api/customer/quotations/:id/request-changes", requireCustomerAuth, as
     if (loanRequest) {
       loanRequest.quotation.status = "changes-requested";
       loanRequest.quotation.changesRequestedAt = new Date();
-      loanRequest.status = "quotation-draft";
+      loanRequest.assessment.status = "in-progress";
+      loanRequest.assessment.loadAudit.status = "in-progress";
+      loanRequest.assessment.loadAudit.result = "pending";
+      loanRequest.assessment.loadAudit.completedAt = null;
+      if (loanRequest.installerAssignment?.installer) {
+        loanRequest.installerAssignment.status = "accepted";
+        loanRequest.installerAssignment.history.push({
+          installer: loanRequest.installerAssignment.installer,
+          installerName: loanRequest.installerAssignment.installerName,
+          status: "accepted",
+          note: `Load-audit revision reopened after customer declined quotation ${quotation.reference}.`,
+          changedAt: new Date(),
+        });
+      }
+      loanRequest.status = "under-assessment";
       loanRequest.statusHistory.push({
-        status: "quotation-draft",
+        status: "under-assessment",
         source: "customer",
-        note: `Customer requested changes to ${quotation.reference}: ${note}`,
+        note: `Customer declined quotation ${quotation.reference} and requested a load/system review: ${note}`,
       });
       await loanRequest.save();
     }
 
     try {
+      const salesEmail = loanRequest?.intake?.createdByEmail || process.env.ADMIN_ALERT_EMAIL || process.env.SMTP_USER;
       await sendEmail({
-        to: process.env.ADMIN_ALERT_EMAIL || process.env.SMTP_USER,
-        subject: `Quotation Changes Requested - ${quotation.reference}`,
-        html: `<p>${escapeHtml(quotation.customer.fullName)} requested changes to ${escapeHtml(quotation.reference)}.</p><p>${escapeHtml(note)}</p>`,
+        to: salesEmail,
+        subject: `Quotation declined - load review required - ${quotation.reference}`,
+        html: `<h2>Customer requested a lower-load system review</h2><p>${escapeHtml(quotation.customer.fullName)} declined ${escapeHtml(quotation.reference)} and requested a review.</p><p><strong>Customer reason:</strong> ${escapeHtml(note)}</p><p>Contact the assigned installer, revise the load audit and recommendation, then prepare and send a new quotation.</p><p><strong>Assigned installer:</strong> ${escapeHtml(loanRequest?.installerAssignment?.installerName || "Not assigned")}</p><p><a href="${frontendUrl()}/sales/projects/${loanRequest?._id}">Open project workspace</a></p>`,
       });
     } catch (mailError) {
       console.error("QUOTATION CHANGE EMAIL ERROR:", mailError.message);
     }
 
-    return res.json({ status: true, message: "Your change request was sent to BuiltRight.", quotation });
+    return res.json({ status: true, message: "Your quotation was declined and the review request was sent to the sales team. They will work with the installer on a revised load and system recommendation.", quotation });
   } catch (error) {
     console.error("REQUEST QUOTATION CHANGES ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not send the change request." });
