@@ -3885,15 +3885,24 @@ app.patch("/api/installer/assignments/:id/report", requireInstallerAuth, async (
       if (Object.prototype.hasOwnProperty.call(source, field)) target[field] = source[field];
     });
     copyFields(loanRequest.assessment.inspection, inspection, ["status", "result", "notes"]);
-    if (loanRequest.intake?.source !== "sales-whatsapp") {
-      copyFields(loanRequest.assessment.loadAudit, loadAudit, ["status", "result", "peakLoadKw", "dailyEnergyKwh", "criticalLoadKw", "recommendedInverterKva", "recommendedBatteryKwh", "recommendedSolarKw", "backupHours", "appliances", "notes"]);
+    copyFields(loanRequest.assessment.loadAudit, loadAudit, ["status", "result", "recommendedInverterKva", "recommendedBatteryKwh", "recommendedSolarKw", "backupHours", "notes"]);
+    if (Array.isArray(loadAudit.appliances)) {
+      const appliances = loadAudit.appliances.slice(0, 100).map((item) => ({
+        name: String(item?.name || "").trim().slice(0, 120),
+        quantity: Math.max(0, Number(item?.quantity || 0)),
+        watts: Math.max(0, Number(item?.watts || 0)),
+        hoursPerDay: Math.min(24, Math.max(0, Number(item?.hoursPerDay || 0))),
+        critical: Boolean(item?.critical),
+      })).filter((item) => item.name && item.quantity > 0 && item.watts > 0);
+      loanRequest.assessment.loadAudit.appliances = appliances;
+      loanRequest.assessment.loadAudit.peakLoadKw = appliances.reduce((total, item) => total + (item.watts * item.quantity), 0) / 1000;
+      loanRequest.assessment.loadAudit.dailyEnergyKwh = appliances.reduce((total, item) => total + (item.watts * item.quantity * item.hoursPerDay), 0) / 1000;
+      loanRequest.assessment.loadAudit.criticalLoadKw = appliances.filter((item) => item.critical).reduce((total, item) => total + (item.watts * item.quantity), 0) / 1000;
     }
     copyFields(loanRequest.assessment.dueDiligence, dueDiligence, ["status", "result", "checklist", "notes"]);
     copyFields(loanRequest.inspection, siteDetails, ["propertyType", "cableDistance", "mountingMethod", "notes"]);
     loanRequest.assessment.inspection.completedBy = loanRequest.installerAssignment.installerName;
-    if (loanRequest.intake?.source !== "sales-whatsapp") {
-      loanRequest.assessment.loadAudit.completedBy = loanRequest.installerAssignment.installerName;
-    }
+    loanRequest.assessment.loadAudit.completedBy = loanRequest.installerAssignment.installerName;
     loanRequest.assessment.dueDiligence.completedBy = loanRequest.installerAssignment.installerName;
     if (Array.isArray(inspectionCosts)) {
       loanRequest.inspectionCosts = inspectionCosts
