@@ -243,6 +243,7 @@ const loanRequestSchema = new mongoose.Schema(
       declinedAt: { type: Date, default: null },
       declineReason: { type: String, default: "", trim: true },
       reassignmentCount: { type: Number, default: 0 },
+      revision: { type: Number, default: 0, min: 0 },
       history: {
         type: [
           {

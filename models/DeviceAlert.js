@@ -22,6 +22,9 @@ const deviceAlertSchema = new mongoose.Schema(
       enum: [
         "tamper",
         "cable-disconnected",
+        "protection-bypass",
+        "protection-restored",
+        "device-online",
         "offline",
         "connectivity-restored",
         "default",

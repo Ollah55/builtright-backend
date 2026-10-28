@@ -22,8 +22,24 @@ import ProjectDocument from "./models/ProjectDocument.js";
 import TrainingSettings from "./models/TrainingSettings.js";
 import AdminCredential from "./models/AdminCredential.js";
 import { accountingRoutes } from "./accounting/routes.js";
+import {
+  ASHGRIDX_EVENTS,
+  ashGridEventSemantics,
+  getAshGridXConfig,
+  normalizeAshGridEvent,
+  parseAshGridTimestamp,
+  verifyAshGridWebhook,
+} from "./integrations/ashgridx.js";
 import sendEmail from "./utils/sendEmail.js";
 import { builtRightEnergyLogoDataUri } from "./utils/invoiceBrandAssets.js";
+import {
+  assignmentRevision,
+  installerAssignmentWriteFilter,
+} from "./utils/assignmentConcurrency.js";
+import {
+  assessmentPaymentState,
+  initialAssessmentInspection,
+} from "./utils/assessmentPayment.js";
 
 dotenv.config();
 
@@ -35,50 +51,9 @@ app.use(cors());
 const getAshGridHeader = (req, name, fallback) =>
   req.get(name || fallback) || req.get(fallback) || "";
 
-const ashGridWebhookSecret = () => process.env.ASHGRIDX_WEBHOOK_SECRET || "";
-
-const verifyAshGridWebhook = (rawBody, signature, timestamp) => {
-  const secret = ashGridWebhookSecret();
-  if (!secret) return { valid: false, code: "not-configured" };
-  if (!rawBody || !signature) return { valid: false, code: "missing-signature" };
-
-  let parsed;
-  try {
-    parsed = JSON.parse(rawBody.toString("utf8"));
-  } catch {
-    return { valid: false, code: "invalid-json" };
-  }
-  const effectiveTimestamp = timestamp || parsed.timestamp;
-  if (!effectiveTimestamp) return { valid: false, code: "missing-timestamp" };
-
-  const timestampNumber = Number(effectiveTimestamp);
-  if (!Number.isFinite(timestampNumber)) return { valid: false, code: "invalid-timestamp" };
-  if (Math.abs(Math.floor(Date.now() / 1000) - timestampNumber) > 120) {
-    return { valid: false, code: "stale-timestamp" };
-  }
-
-  // AshGridX signs the exact event/timestamp/data envelope. The raw body is
-  // retained for the audit fingerprint and is never trusted before this check.
-  const signedPayload = JSON.stringify({
-    event: parsed.event,
-    timestamp: String(effectiveTimestamp),
-    data: parsed.data,
-  });
-  const expected = crypto.createHmac("sha256", secret).update(signedPayload).digest("hex");
-  const supplied = String(signature).replace(/^sha256=/i, "").trim();
-  const expectedBuffer = Buffer.from(expected, "utf8");
-  const suppliedBuffer = Buffer.from(supplied, "utf8");
-  const valid = expectedBuffer.length === suppliedBuffer.length && crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
-  return { valid, code: valid ? "ok" : "invalid-signature", parsed, timestamp: timestampNumber };
-};
-
-const ashGridEventDeviceNumber = (payload = {}) =>
-  payload.deviceNumber || payload.deviceId || payload.customerDeviceId || payload.data?.deviceNumber || payload.data?.deviceId || payload.data?.customerDeviceId;
-
-const processAshGridXEvent = async ({ payload, rawBody, source = "provider-webhook" }) => {
-  const eventName = String(payload.event || payload.type || payload.data?.event || "UNKNOWN").toUpperCase();
-  const data = payload.data && typeof payload.data === "object" ? payload.data : payload;
-  const identifier = ashGridEventDeviceNumber(data) || ashGridEventDeviceNumber(payload);
+const processAshGridXEvent = async ({ payload, rawBody, source = "provider-webhook", verifiedOccurredAt = null }) => {
+  const { eventName, data, deviceIdentifier: identifier } = normalizeAshGridEvent(payload);
+  const semantics = ashGridEventSemantics(eventName);
   const fingerprint = `ashgridx-${crypto.createHash("sha256").update(rawBody || JSON.stringify(payload)).digest("hex")}`;
   const duplicate = await DeviceAlert.findOne({ providerEventId: fingerprint });
   if (duplicate) return { duplicate: true, alert: duplicate };
@@ -86,51 +61,64 @@ const processAshGridXEvent = async ({ payload, rawBody, source = "provider-webho
   const device = await resolveDevice(identifier);
   if (!device) return { ignored: true, reason: "device-not-registered", identifier, eventName };
 
-  const isTamper = ["BYPASS", "TAMPER", "CABLE_DISCONNECTED", "PROTECTION_BYPASS"].includes(eventName);
-  const isRestored = ["TAMPER_RESTORED", "PROTECTION_RESTORED", "NORMAL", "CLEAR"].includes(eventName);
-  const isOffline = ["DEVICE_OFFLINE", "DISCONNECTED"].includes(eventName);
-  const occurredAt = payload.timestamp ? new Date(Number(payload.timestamp) * 1000) : new Date();
-
-  if (isTamper) {
+  const occurredAt = verifiedOccurredAt || parseAshGridTimestamp(payload.timestamp) || new Date();
+  if (semantics.tamperState === "confirmed") {
     device.tamper = {
       status: "confirmed",
-      eventType: "BYPASS",
+      eventType: eventName,
       detectedAt: occurredAt,
       acknowledgedAt: null,
-      notes: "AshGridX reported a protection bypass/cable disconnection.",
+      notes: semantics.detail,
     };
-    device.inverterState = "off";
-  } else if (isRestored) {
+  } else if (semantics.tamperState === "clear") {
     device.tamper = {
       status: "clear",
       eventType: eventName,
       detectedAt: device.tamper?.detectedAt || null,
       acknowledgedAt: device.tamper?.acknowledgedAt || null,
-      notes: "AshGridX reported that the protection condition has cleared.",
+      notes: semantics.detail,
     };
   }
-  if (isOffline) device.connectivity = "offline";
-  if (["DEVICE_ONLINE", "CONNECTED", "CONNECTIVITY_RESTORED"].includes(eventName)) {
-    device.connectivity = "online";
-    device.lastSeenAt = occurredAt;
-  }
+  if (semantics.connectivity) device.connectivity = semantics.connectivity;
+  if (semantics.protectionState) device.protectionState = semantics.protectionState;
+  if (semantics.connectivity === "online") device.lastSeenAt = occurredAt;
+  device.lastProviderEvent = eventName;
+  device.lastProviderEventAt = occurredAt;
   device.lastProviderSyncAt = new Date();
   await device.save();
 
+  if (eventName === "BYPASS_REVERSED") {
+    await DeviceAlert.updateMany(
+      {
+        device: device._id,
+        status: { $in: ["open", "acknowledged"] },
+        type: { $in: ["tamper", "cable-disconnected", "protection-bypass"] },
+      },
+      {
+        $set: {
+          status: "resolved",
+          resolvedAt: occurredAt,
+          resolvedBy: "AshGridX BYPASS_REVERSED event",
+        },
+      }
+    );
+  }
+
+  const informational = semantics.severity === "info";
   const alert = await DeviceAlert.create({
     reference: generateOperationsReference("BRALT"),
     device: device._id,
     deviceReference: device.reference,
     providerEventId: fingerprint,
-    type: isTamper ? "cable-disconnected" : isOffline ? "offline" : isRestored ? "connectivity-restored" : "other",
-    severity: isTamper ? "critical" : isOffline ? "warning" : "info",
-    status: "open",
+    type: semantics.alertType,
+    severity: semantics.severity,
+    status: informational ? "resolved" : "open",
     source,
     occurredAt,
-    title: isTamper ? "AshGridX BYPASS / tamper detected" : `AshGridX ${eventName.toLowerCase().replaceAll("_", " ")}`,
-    detail: isTamper
-      ? "The inverter protection circuit reported a cable disconnection. The device should be investigated at the assigned site."
-      : String(data.reason || data.message || "Provider event received and recorded."),
+    resolvedAt: informational ? occurredAt : null,
+    resolvedBy: informational ? "AshGridX event processor" : "",
+    title: semantics.title,
+    detail: String(data.reason || data.message || semantics.detail),
     evidence: { event: eventName, deviceNumber: identifier, payload },
   });
   return { alert, device, eventName };
@@ -161,7 +149,13 @@ app.post(
       || req.get("x-webhook-signature");
     const timestamp = getAshGridHeader(req, timestampHeader, "x-ashgridx-timestamp")
       || req.get("x-timestamp");
-    const verification = verifyAshGridWebhook(req.body, signature, timestamp);
+    const verification = verifyAshGridWebhook({
+      rawBody: req.body,
+      signature,
+      timestamp,
+      secret: process.env.ASHGRIDX_WEBHOOK_SECRET || "",
+      toleranceSeconds: Number(process.env.ASHGRIDX_WEBHOOK_TOLERANCE_SECONDS || 120),
+    });
     if (verification.code === "not-configured") {
       return res.status(503).json({ status: false, code: "ASHGRIDX_WEBHOOK_NOT_CONFIGURED", message: "AshGridX webhook secret is not configured." });
     }
@@ -169,7 +163,11 @@ app.post(
       return res.status(401).json({ status: false, code: `ASHGRIDX_WEBHOOK_${verification.code.toUpperCase()}`, message: "AshGridX webhook signature could not be verified." });
     }
     try {
-      const result = await processAshGridXEvent({ payload: verification.parsed, rawBody: req.body });
+      const result = await processAshGridXEvent({
+        payload: verification.parsed,
+        rawBody: req.body,
+        verifiedOccurredAt: verification.occurredAt,
+      });
       return res.status(200).json({ status: true, received: true, ...result });
     } catch (error) {
       console.error("AshGridX webhook processing error:", error);
@@ -544,11 +542,10 @@ const zoomMeetingSdkConfigured = Boolean(
 // Credentials can be stored now, but outbound commands remain closed unless
 // the pilot is explicitly enabled. This prevents a staging key from reaching
 // a live inverter by accident.
-const ashGridCredentialsPresent = Boolean(
-  process.env.ASHGRIDX_API_BASE_URL && process.env.ASHGRIDX_API_KEY
-);
-const ashGridWebhookConfigured = Boolean(process.env.ASHGRIDX_WEBHOOK_SECRET);
-const ashGridAdapterReady = process.env.ASHGRIDX_ENABLED === "true" && ashGridCredentialsPresent && ashGridWebhookConfigured;
+const ashGridConfig = getAshGridXConfig();
+const ashGridCredentialsPresent = ashGridConfig.credentialsPresent;
+const ashGridWebhookConfigured = ashGridConfig.webhookConfigured;
+const ashGridAdapterReady = ashGridConfig.adapterReady;
 
 app.get("/api/integrations/status", requireAdminAuth, (req, res) => {
   res.json({
@@ -562,7 +559,14 @@ app.get("/api/integrations/status", requireAdminAuth, (req, res) => {
         configured: ashGridAdapterReady,
         credentialsPresent: ashGridCredentialsPresent,
         webhookConfigured: ashGridWebhookConfigured,
-        mode: ashGridAdapterReady ? "sandbox" : "pilot-placeholder",
+        commandsEnabled: ashGridConfig.commandsEnabled,
+        disconnectReady: ashGridConfig.disconnectReady,
+        activationTokenReady: ashGridConfig.activationTokenReady,
+        environment: ashGridConfig.environment,
+        baseUrlConfigured: Boolean(ashGridConfig.baseUrl),
+        mode: ashGridAdapterReady ? ashGridConfig.environment : "pilot-placeholder",
+        webhookPath: "/api/webhooks/ashgridx",
+        events: ASHGRIDX_EVENTS,
       },
     },
   });
@@ -605,8 +609,14 @@ async function resolveDevice(identifier) {
 async function handleDeviceControl(req, res) {
   try {
     const identifier =
-      req.params.id || req.body.deviceId || req.body.customerDeviceId;
-    const action = req.body.action || req.body.control;
+      req.params.id || req.body.deviceId || req.body.customerDeviceId || req.body.deviceNumber;
+    const requestedAction = req.body.action || req.body.control;
+    const action = {
+      off: "disconnect-load",
+      on: "restore-load",
+      "disconnect-load": "disconnect-load",
+      "restore-load": "restore-load",
+    }[requestedAction];
     const reason = String(req.body.reason || "").trim();
     const device = await resolveDevice(identifier);
 
@@ -614,10 +624,10 @@ async function handleDeviceControl(req, res) {
       return res.status(404).json({ status: false, message: "Device not found." });
     }
 
-    if (!["on", "off"].includes(action)) {
+    if (!action) {
       return res.status(400).json({
         status: false,
-        message: "Device action must be either on or off.",
+        message: "Device action must be disconnect-load or restore-load.",
       });
     }
 
@@ -640,7 +650,7 @@ async function handleDeviceControl(req, res) {
       policyFailures.push("Device connectivity must be online and verified.");
     }
 
-    if (action === "off") {
+    if (action === "disconnect-load") {
       if (device.paymentStanding !== "default-eligible") {
         policyFailures.push("Customer default has not been marked eligible for disablement.");
       }
@@ -655,8 +665,8 @@ async function handleDeviceControl(req, res) {
       }
     }
 
-    if (action === "on" && !["current", "cleared"].includes(device.paymentStanding)) {
-      policyFailures.push("Payment clearance must be recorded before activation.");
+    if (action === "restore-load" && !["current", "cleared"].includes(device.paymentStanding)) {
+      policyFailures.push("Payment clearance must be recorded before customer-load restoration.");
     }
 
     const policySnapshot = {
@@ -694,6 +704,14 @@ async function handleDeviceControl(req, res) {
       });
     }
 
+    const pendingReason = !ashGridConfig.commandsEnabled
+      ? "Outbound AshGridX commands are disabled for the pilot."
+      : action === "disconnect-load" && !ashGridConfig.disconnectReady
+        ? "AshGridX disconnect endpoint and request mapping are pending."
+        : action === "restore-load" && !ashGridConfig.activationTokenReady
+          ? "AshGridX activation-token endpoint and user guide are pending."
+          : "AshGridX command adapter is awaiting the final sandbox request mapping.";
+
     const command = await DeviceCommand.create({
       reference: generateOperationsReference("BRCMD"),
       device: device._id,
@@ -707,7 +725,7 @@ async function handleDeviceControl(req, res) {
       reason,
       policySnapshot,
       blockedReason: ashGridCredentialsPresent
-        ? "AshGridX adapter awaiting final acknowledgement and tamper rules."
+        ? pendingReason
         : "AshGridX staging credentials are not configured.",
     });
 
@@ -715,7 +733,7 @@ async function handleDeviceControl(req, res) {
       status: false,
       code: "ASHGRIDX_NOT_CONFIGURED",
       message:
-        "No device command was sent. The safe provider adapter remains inactive.",
+        "No customer-load command was sent. The safe provider adapter remains inactive until AshGridX supplies the remaining sandbox command details.",
       commandReference: command.reference,
     });
   } catch (error) {
@@ -850,6 +868,10 @@ app.patch("/api/admin/devices/:id", requireAdminAuth, async (req, res) => {
       "assignmentStatus",
       "connectivity",
       "inverterState",
+      "loadServiceState",
+      "protectionState",
+      "lastProviderEvent",
+      "lastProviderEventAt",
       "lastSeenAt",
       "tamper",
       "paymentStanding",
@@ -898,6 +920,56 @@ app.patch("/api/admin/devices/:id", requireAdminAuth, async (req, res) => {
 
 app.post("/api/admin/devices/:id/control", requireAdminAuth, handleDeviceControl);
 
+app.post("/api/integrations/ashgridx/device/activation-token", requireAdminAuth, async (req, res) => {
+  try {
+    const identifier = req.body.deviceId || req.body.customerDeviceId || req.body.deviceNumber;
+    const device = await resolveDevice(identifier);
+    if (!device) return res.status(404).json({ status: false, message: "Device not found." });
+
+    const humanConfirmed = req.body.confirmation === device.reference;
+    const policyFailures = [];
+    if (!humanConfirmed) policyFailures.push(`Type ${device.reference} to confirm token generation.`);
+    if (device.connectivity !== "online") policyFailures.push("Device connectivity must be online and verified.");
+    if (!["current", "cleared"].includes(device.paymentStanding)) {
+      policyFailures.push("Payment clearance must be recorded before generating a restoration token.");
+    }
+
+    const command = await DeviceCommand.create({
+      reference: generateOperationsReference("BRCMD"),
+      device: device._id,
+      deviceReference: device.reference,
+      action: "generate-activation-token",
+      status: "blocked",
+      requestedBy: { id: req.admin?.id || "", email: req.admin?.email || "" },
+      reason: String(req.body.reason || "Customer-load restoration token requested").trim(),
+      policySnapshot: {
+        paymentStanding: device.paymentStanding,
+        gracePeriodEndsAt: device.gracePeriod?.endsAt || null,
+        defaultVerifiedAt: device.defaultVerifiedAt,
+        communicationsCompletedAt: device.gracePeriod?.communicationsCompletedAt || null,
+        deviceConnectivity: device.connectivity,
+        humanConfirmed,
+      },
+      blockedReason: policyFailures.length
+        ? policyFailures.join(" ")
+        : "AshGridX activation-token endpoint, response schema and delivery guide are pending.",
+    });
+
+    return res.status(policyFailures.length ? 409 : 503).json({
+      status: false,
+      code: policyFailures.length ? "ACTIVATION_TOKEN_POLICY_BLOCKED" : "ASHGRIDX_ACTIVATION_TOKEN_PENDING",
+      message: policyFailures.length
+        ? "Activation-token request blocked by BuiltRight safety policy."
+        : "No activation token was requested. The AshGridX activation-token adapter is prepared but remains locked.",
+      reasons: policyFailures,
+      commandReference: command.reference,
+    });
+  } catch (error) {
+    console.error("AshGridX activation-token error:", error);
+    return res.status(500).json({ status: false, message: "Activation-token request could not be prepared." });
+  }
+});
+
 app.get("/api/admin/devices/:id/status", requireAdminAuth, async (req, res) => {
   try {
     const device = await resolveDevice(req.params.id);
@@ -909,7 +981,7 @@ app.get("/api/admin/devices/:id/status", requireAdminAuth, async (req, res) => {
     return res.json({
       status: true,
       provider: "AshGridX",
-      liveStateQuerySupported: ashGridAdapterReady,
+      liveStateQuerySupported: false,
       device,
       alerts,
       commands,
@@ -928,7 +1000,7 @@ app.post("/api/admin/devices/:id/simulate-event", requireAdminAuth, async (req, 
     const device = await resolveDevice(req.params.id);
     if (!device) return res.status(404).json({ status: false, message: "Device not found." });
     const event = String(req.body.event || "BYPASS").toUpperCase();
-    const allowedEvents = ["BYPASS", "TAMPER_RESTORED", "DEVICE_OFFLINE", "DEVICE_ONLINE", "CONNECTED"];
+    const allowedEvents = ASHGRIDX_EVENTS;
     if (!allowedEvents.includes(event)) {
       return res.status(400).json({ status: false, message: `Test event must be one of: ${allowedEvents.join(", ")}.` });
     }
@@ -1401,6 +1473,7 @@ const buildProjectDocumentPdf = (projectDocument) => {
 const createInspectionFeeInvoice = async (loanRequest) => {
   const amount = Number(loanRequest.inspection?.feeAmount || 0);
   if (!(amount > 0)) return null;
+  const paymentAlreadyConfirmed = loanRequest.inspection?.feeStatus === "payment-confirmed";
   const reference = `BRI-${String(loanRequest.reference || loanRequest._id).replace(/[^A-Z0-9-]/gi, "").toUpperCase()}`;
   const order = await Order.findOne({ financingRequestId: loanRequest._id }).select("_id").lean();
   const payload = {
@@ -1438,8 +1511,10 @@ const createInspectionFeeInvoice = async (loanRequest) => {
     equityPercentage: 100,
     equityAmount: amount,
     bankFinanceAmount: 0,
-    terms: `Pay to ${inspectionPaymentDetails.bank}, account ${inspectionPaymentDetails.accountNumber}, ${inspectionPaymentDetails.accountName}. Upload proof of payment in your BuiltRight customer profile for sales confirmation.`,
-    notes: "This invoice covers the pre-installation site assessment only. The final system, installation materials and full project cost will be confirmed after assessment.",
+    terms: paymentAlreadyConfirmed
+      ? "Assessment-fee payment has already been recorded and confirmed by BuiltRight sales. No payment upload is required."
+      : `Pay to ${inspectionPaymentDetails.bank}, account ${inspectionPaymentDetails.accountNumber}, ${inspectionPaymentDetails.accountName}. Upload proof of payment in your BuiltRight customer profile for sales confirmation.`,
+    notes: `${paymentAlreadyConfirmed ? "PAYMENT CONFIRMED. " : ""}This invoice covers the pre-installation site assessment only. The final system, installation materials and full project cost will be confirmed after assessment.`,
     sentAt: new Date(),
     emailDelivery: { status: "not-sent" },
     createdBy: "BuiltRight sales operations",
@@ -2416,6 +2491,33 @@ const sanitizeInstallerAssignment = (loanRequest) => {
   };
 };
 
+const assignmentChanged = (res) => res.status(409).json({
+  status: false,
+  code: "ASSIGNMENT_CHANGED",
+  message: "This project assignment changed while you were working. Your update was not saved. Refresh your assignments before continuing.",
+});
+
+const requiredAssignmentRevision = (req, res) => {
+  if (!Object.prototype.hasOwnProperty.call(req.body || {}, "assignmentRevision")) {
+    res.status(400).json({
+      status: false,
+      code: "ASSIGNMENT_REVISION_REQUIRED",
+      message: "Refresh this assignment before submitting an update.",
+    });
+    return null;
+  }
+  const revision = Number(req.body.assignmentRevision);
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    res.status(400).json({
+      status: false,
+      code: "ASSIGNMENT_REVISION_INVALID",
+      message: "The assignment revision is invalid. Refresh before continuing.",
+    });
+    return null;
+  }
+  return revision;
+};
+
 const assignInstallerToLoanRequest = async (loanRequest, { excludedIds = [], reassigned = false, note = "" } = {}) => {
   const installer = await chooseInstaller(excludedIds);
   if (!installer) return null;
@@ -2430,6 +2532,7 @@ const assignInstallerToLoanRequest = async (loanRequest, { excludedIds = [], rea
     declinedAt: null,
     declineReason: "",
     reassignmentCount: Number(loanRequest.installerAssignment?.reassignmentCount || 0) + (reassigned ? 1 : 0),
+    revision: assignmentRevision(loanRequest.installerAssignment?.revision) + 1,
     history: [...previousHistory, { installer: installer._id, installerName: installer.fullName, status: "assigned", note: note || (reassigned ? "Automatically reassigned after decline." : "Automatically assigned when financing request was submitted."), changedAt: new Date() }],
   };
   loanRequest.status = "internal-review";
@@ -2460,6 +2563,7 @@ const assignSpecificInstallerToLoanRequest = async (loanRequest, installerId, as
     declinedAt: null,
     declineReason: "",
     reassignmentCount: Number(loanRequest.installerAssignment?.reassignmentCount || 0),
+    revision: assignmentRevision(loanRequest.installerAssignment?.revision) + 1,
     history: [...previousHistory, {
       installer: installer._id,
       installerName: installer.fullName,
@@ -3031,7 +3135,7 @@ app.get("/api/sales/projects", requireOperationsAuth, async (req, res) => {
 
 app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
   try {
-    const { customer = {}, installerId, inspectionFeeAmount, paymentMethod, financeInstitution, systemDescription, notes, consentCaptured, inspectionCompleted } = req.body;
+    const { customer = {}, installerId, inspectionFeeAmount, paymentMethod, financeInstitution, systemDescription, notes, consentCaptured, inspectionCompleted, assessmentFeePaid } = req.body;
     if (!customer.fullName || !customer.email || !customer.phone || !customer.location) {
       return res.status(400).json({ status: false, message: "Customer name, email, phone number, and project location are required." });
     }
@@ -3039,6 +3143,13 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
       return res.status(400).json({ status: false, message: "Confirm that the customer consented to BuiltRight recording and using the supplied project information." });
     }
     const completedOffline = Boolean(inspectionCompleted);
+    const paymentConfirmed = completedOffline || Boolean(assessmentFeePaid);
+    if (!completedOffline && !paymentConfirmed) {
+      return res.status(400).json({
+        status: false,
+        message: "Confirm that the assessment fee has been received before assigning an installer.",
+      });
+    }
     if (!completedOffline && !installerId) return res.status(400).json({ status: false, message: "Select the installer who will perform the site assessment." });
     const normalizedFee = Number(String(inspectionFeeAmount ?? "").replace(/[^\d.]/g, ""));
     if (!completedOffline && !(normalizedFee > 0)) return res.status(400).json({ status: false, message: "Enter an assessment fee greater than zero." });
@@ -3091,16 +3202,18 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
           ],
         },
       },
-      inspection: completedOffline
-        ? { feeAmount: normalizedFee > 0 ? normalizedFee : null, feeStatus: "payment-confirmed", status: "completed", completedAt: new Date(), paymentConfirmedAt: new Date() }
-        : { feeAmount: normalizedFee, feeStatus: "not-requested", status: "not-scheduled" },
+      inspection: initialAssessmentInspection({
+        feeAmount: normalizedFee,
+        paymentConfirmed,
+        completed: completedOffline,
+      }),
       status: completedOffline ? "inspection-completed" : "submitted",
       statusHistory: [{
         status: completedOffline ? "inspection-completed" : "submitted",
         source: "sales",
         note: completedOffline
           ? `Customer registered by ${salesName}; offline/WhatsApp inspection, load audit, and assessment payment recorded as completed.`
-          : `Customer assessment booking created by ${salesName}; assessment fee recorded by sales.`,
+          : `Customer assessment booking created by ${salesName}; assessment payment received and confirmed by sales before installer assignment.`,
       }],
       notes: String(notes || ""),
     });
@@ -3142,7 +3255,7 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
       status: true,
       message: completedOffline
         ? `Customer registered, offline assessment recorded, and order ${order.orderNumber} created.`
-        : `Customer registered, order ${order.orderNumber} created, and site assessment assigned to ${installer.fullName}.`,
+        : `Customer registered, payment confirmed, order ${order.orderNumber} created, and site assessment assigned to ${installer.fullName}.`,
       loanRequest,
       order,
     });
@@ -3180,10 +3293,7 @@ app.patch("/api/sales/projects/:id/assessment-payment-confirmed", requireOperati
     }
     loanRequest.inspection.feeStatus = "payment-confirmed";
     loanRequest.inspection.paymentConfirmedAt = new Date();
-    loanRequest.inspection.status = "in-progress";
-    loanRequest.installerAssignment.status = "accepted";
-    loanRequest.assessment.status = "in-progress";
-    loanRequest.statusHistory.push({ status: loanRequest.status, source: "sales", note: "Assessment payment confirmed by the sales team; installer cleared to proceed." });
+    loanRequest.statusHistory.push({ status: loanRequest.status, source: "sales", note: "Assessment payment confirmed by the sales team; installer may now accept and schedule the inspection." });
     await loanRequest.save();
     const installer = await User.findById(loanRequest.installerAssignment?.installer).select("fullName email phone").lean();
     if (installer) {
@@ -3192,13 +3302,13 @@ app.patch("/api/sales/projects/:id/assessment-payment-confirmed", requireOperati
         sendEmail({
           to: installer.email,
           subject: `Assessment cleared to proceed - ${loanRequest.reference}`,
-          html: `<p>Hello ${safeHtml(installer.fullName)},</p><p>Sales has confirmed the customer's assessment payment for ${safeHtml(loanRequest.reference)}. You may now proceed with the scheduled visit and complete the field report.</p><p><a href="${portalUrl}">Open installer profile</a></p>`,
+          html: `<p>Hello ${safeHtml(installer.fullName)},</p><p>Sales has confirmed the customer's assessment payment for ${safeHtml(loanRequest.reference)}. Please sign in, accept the assignment, contact the customer, and schedule the inspection.</p><p><a href="${portalUrl}">Open installer profile</a></p>`,
         }),
-        installer.phone ? sendSms({ to: installer.phone, message: `BuiltRight: Assessment ${loanRequest.reference} is cleared to proceed. Open your installer profile: ${portalUrl}` }) : Promise.resolve(),
+        installer.phone ? sendSms({ to: installer.phone, message: `BuiltRight: Payment for assessment ${loanRequest.reference} is confirmed. Accept and schedule it in your installer profile: ${portalUrl}` }) : Promise.resolve(),
       ]);
       outcomes.filter((item) => item.status === "rejected").forEach((item) => console.error("ASSESSMENT CLEARANCE NOTICE ERROR:", item.reason?.message || item.reason));
     }
-    return res.json({ status: true, message: "Assessment payment confirmed. The installer has been cleared to proceed.", loanRequest });
+    return res.json({ status: true, message: "Assessment payment confirmed. The installer can now accept and schedule the inspection.", loanRequest });
   } catch (error) {
     console.error("CONFIRM ASSESSMENT PAYMENT ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not confirm the assessment payment." });
@@ -3207,15 +3317,68 @@ app.patch("/api/sales/projects/:id/assessment-payment-confirmed", requireOperati
 
 app.patch("/api/sales/projects/:id/installer", requireOperationsAuth, async (req, res) => {
   try {
-    const loanRequest = await LoanRequest.findById(req.params.id);
-    if (!loanRequest) return res.status(404).json({ status: false, message: "Customer project not found." });
-    if (["completed"].includes(loanRequest.installerAssignment?.status)) {
-      return res.status(409).json({ status: false, message: "A completed site assessment cannot be reassigned." });
-    }
-    const salesUser = await User.findById(req.staff.id).select("fullName").lean();
-    const installer = await assignSpecificInstallerToLoanRequest(loanRequest, req.body.installerId, salesUser?.fullName || req.staff.email);
+    const installer = await User.findOne({
+      _id: req.body.installerId,
+      role: "installer",
+      isActive: true,
+      "installerProfile.availability": "available",
+    });
     if (!installer) return res.status(409).json({ status: false, message: "The selected installer is not available." });
-    await loanRequest.save();
+    const salesUser = await User.findById(req.staff.id).select("fullName").lean();
+    const assignedBy = salesUser?.fullName || req.staff.email;
+    const now = new Date();
+    const loanRequest = await LoanRequest.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        "installerAssignment.status": { $ne: "completed" },
+        "inspection.feeStatus": "payment-confirmed",
+      },
+      {
+        $set: {
+          "installerAssignment.installer": installer._id,
+          "installerAssignment.installerName": installer.fullName,
+          "installerAssignment.installerEmail": installer.email,
+          "installerAssignment.status": "assigned",
+          "installerAssignment.assignedAt": now,
+          "installerAssignment.acceptedAt": null,
+          "installerAssignment.declinedAt": null,
+          "installerAssignment.declineReason": "",
+          status: "internal-review",
+        },
+        $inc: {
+          "installerAssignment.reassignmentCount": 1,
+          "installerAssignment.revision": 1,
+        },
+        $push: {
+          "installerAssignment.history": {
+            installer: installer._id,
+            installerName: installer.fullName,
+            status: "assigned",
+            note: `Manually assigned by ${assignedBy}.`,
+            changedAt: now,
+          },
+          statusHistory: {
+            status: "internal-review",
+            source: "sales",
+            note: `Site assessment assigned to ${installer.fullName} by ${assignedBy}.`,
+            changedAt: now,
+          },
+        },
+      },
+      { new: true, runValidators: true },
+    );
+    if (!loanRequest) {
+      const existingProject = await LoanRequest.findById(req.params.id).select("inspection.feeStatus installerAssignment.status").lean();
+      const paymentConfirmed = existingProject?.inspection?.feeStatus === "payment-confirmed";
+      return res.status(existingProject ? 409 : 404).json({
+        status: false,
+        message: !existingProject
+          ? "Customer project not found."
+          : !paymentConfirmed
+            ? "Confirm the assessment payment before assigning an installer."
+            : "A completed site assessment cannot be reassigned.",
+      });
+    }
     try { await sendInstallerAssignmentEmail(loanRequest, installer, true); } catch (mailError) { console.error("MANUAL ASSIGNMENT EMAIL ERROR:", mailError.message); }
     return res.json({ status: true, message: `Project assigned to ${installer.fullName}.`, loanRequest });
   } catch (error) {
@@ -3460,16 +3623,49 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
   try {
     const { scheduledAt } = req.body;
     const normalizedScheduledAt = String(scheduledAt || "").trim();
-    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    const currentRevision = requiredAssignmentRevision(req, res);
+    if (currentRevision === null) return;
+    let loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
     if (!loanRequest || !["assigned", "accepted"].includes(loanRequest.installerAssignment?.status)) {
-      return res.status(404).json({ status: false, message: "This assignment is no longer available for acceptance." });
+      return assignmentChanged(res);
+    }
+    const paymentState = assessmentPaymentState(loanRequest.inspection?.feeStatus);
+    if (!paymentState.confirmed) {
+      return res.status(409).json({
+        status: false,
+        code: "ASSESSMENT_PAYMENT_NOT_CONFIRMED",
+        message: "The assessment payment has not been confirmed by sales. You cannot accept or schedule this inspection yet.",
+      });
     }
     if (!normalizedScheduledAt) {
-      loanRequest.installerAssignment.status = "accepted";
-      loanRequest.installerAssignment.acceptedAt ||= new Date();
-      loanRequest.installerAssignment.history.push({ installer: req.installer.id, installerName: loanRequest.installerAssignment.installerName, status: "accepted", note: "Installer accepted the assignment and will contact the customer before scheduling.", changedAt: new Date() });
-      await loanRequest.save();
-      return res.json({ status: true, message: "Assignment accepted. Contact the customer, then set the agreed inspection date and time.", loanRequest: sanitizeInstallerAssignment(loanRequest) });
+      const now = new Date();
+      const accepted = await LoanRequest.findOneAndUpdate(
+        installerAssignmentWriteFilter({
+          projectId: req.params.id,
+          installerId: req.installer.id,
+          revision: currentRevision,
+          statuses: ["assigned", "accepted"],
+        }),
+        {
+          $set: {
+            "installerAssignment.status": "accepted",
+            "installerAssignment.acceptedAt": loanRequest.installerAssignment.acceptedAt || now,
+          },
+          $inc: { "installerAssignment.revision": 1 },
+          $push: {
+            "installerAssignment.history": {
+              installer: req.installer.id,
+              installerName: loanRequest.installerAssignment.installerName,
+              status: "accepted",
+              note: "Installer accepted the assignment and will contact the customer before scheduling.",
+              changedAt: now,
+            },
+          },
+        },
+        { new: true, runValidators: true },
+      );
+      if (!accepted) return assignmentChanged(res);
+      return res.json({ status: true, message: "Assignment accepted. Contact the customer, then set the agreed inspection date and time.", loanRequest: sanitizeInstallerAssignment(accepted) });
     }
     const normalizedFee = Number(loanRequest.inspection?.feeAmount);
     const normalizedLocation = String(loanRequest.customer?.location || "").trim();
@@ -3478,19 +3674,48 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
     if (Number.isNaN(scheduledDate.getTime()) || scheduledDate <= new Date()) {
       return res.status(400).json({ status: false, message: "Choose a future inspection date and time." });
     }
-    loanRequest.installerAssignment.status = "scheduled";
-    loanRequest.installerAssignment.acceptedAt = new Date();
-    loanRequest.installerAssignment.history.push({ installer: req.installer.id, installerName: loanRequest.installerAssignment.installerName, status: "accepted", note: "Installer accepted and scheduled the inspection.", changedAt: new Date() });
-    loanRequest.inspection.status = "scheduled";
-    loanRequest.inspection.scheduledAt = scheduledDate;
-    loanRequest.inspection.assignee = loanRequest.installerAssignment.installerName;
-    loanRequest.inspection.notes = `Inspection location: ${normalizedLocation}`;
-    loanRequest.inspection.feeStatus = "payment-requested";
-    loanRequest.assessment.inspection.status = "scheduled";
-    loanRequest.assessment.status = "in-progress";
-    loanRequest.status = "inspection-scheduled";
-    loanRequest.statusHistory.push({ status: "inspection-scheduled", source: "installer", note: `Inspection scheduled by ${loanRequest.installerAssignment.installerName}.` });
-    await loanRequest.save();
+    const now = new Date();
+    const scheduled = await LoanRequest.findOneAndUpdate(
+      installerAssignmentWriteFilter({
+        projectId: req.params.id,
+        installerId: req.installer.id,
+        revision: currentRevision,
+        statuses: ["assigned", "accepted"],
+      }),
+      {
+        $set: {
+          "installerAssignment.status": "scheduled",
+          "installerAssignment.acceptedAt": now,
+          "inspection.status": "scheduled",
+          "inspection.scheduledAt": scheduledDate,
+          "inspection.assignee": loanRequest.installerAssignment.installerName,
+          "inspection.notes": `Inspection location: ${normalizedLocation}`,
+          "inspection.feeStatus": paymentState.scheduledFeeStatus,
+          "assessment.inspection.status": "scheduled",
+          "assessment.status": "in-progress",
+          status: "inspection-scheduled",
+        },
+        $inc: { "installerAssignment.revision": 1 },
+        $push: {
+          "installerAssignment.history": {
+            installer: req.installer.id,
+            installerName: loanRequest.installerAssignment.installerName,
+            status: "accepted",
+            note: "Installer accepted and scheduled the inspection.",
+            changedAt: now,
+          },
+          statusHistory: {
+            status: "inspection-scheduled",
+            source: "installer",
+            note: `Inspection scheduled by ${loanRequest.installerAssignment.installerName}.`,
+            changedAt: now,
+          },
+        },
+      },
+      { new: true, runValidators: true },
+    );
+    if (!scheduled) return assignmentChanged(res);
+    loanRequest = scheduled;
     let inspectionInvoice = null;
     try {
       inspectionInvoice = await createInspectionFeeInvoice(loanRequest);
@@ -3506,7 +3731,7 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
       await sendEmail({
         to: loanRequest.customer.email,
         subject: `BuiltRight inspection scheduled - ${loanRequest.reference}`,
-        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(normalizedLocation)}</li><li><strong>Inspection fee:</strong> ${formatNaira(normalizedFee)}</li></ul><p>Your branded inspection-fee invoice is attached and is also available in your BuiltRight customer profile.</p><p>Please make the inspection-fee payment using the details below. Then sign in to your BuiltRight customer profile, upload your payment proof, and click <strong>I have paid — submit proof</strong>. Your installer can begin the inspection only after sales confirms receipt.</p><ul><li><strong>Bank:</strong> ${safeHtml(inspectionPaymentDetails.bank)}</li><li><strong>Account number:</strong> ${safeHtml(inspectionPaymentDetails.accountNumber)}</li><li><strong>Account name:</strong> ${safeHtml(inspectionPaymentDetails.accountName)}</li></ul><p><a href="${frontendUrl()}/customer/financing">Open customer profile</a></p>`,
+        html: `<h2>Your site inspection is scheduled</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(loanRequest.installerAssignment.installerName)} has scheduled your site inspection.</p><ul><li><strong>Date and time:</strong> ${safeHtml(scheduledDate.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" }))}</li><li><strong>Location:</strong> ${safeHtml(normalizedLocation)}</li><li><strong>Inspection fee:</strong> ${formatNaira(normalizedFee)}</li></ul><p>Your branded inspection-fee invoice is attached and is also available in your BuiltRight customer profile.</p><p><strong>Your assessment-fee payment has already been received and confirmed.</strong> No payment upload is required. The installer is cleared to proceed with the scheduled assessment.</p><p><a href="${frontendUrl()}/customer/financing">Open customer profile</a></p>`,
         attachments,
       });
       if (inspectionInvoice) {
@@ -3523,12 +3748,12 @@ app.patch("/api/installer/assignments/:id/accept", requireInstallerAuth, async (
     try {
       await sendSms({
         to: loanRequest.customer.phone,
-        message: `BuiltRight: Your assessment ${loanRequest.reference} is scheduled for ${scheduledDate.toLocaleString("en-NG", { dateStyle: "medium", timeStyle: "short" })} at ${normalizedLocation}. Fee: ${formatNaira(normalizedFee)}. Pay ${inspectionPaymentDetails.bank} ${inspectionPaymentDetails.accountNumber}, ${inspectionPaymentDetails.accountName}, then upload proof in your profile.`,
+        message: `BuiltRight: Your assessment ${loanRequest.reference} is scheduled for ${scheduledDate.toLocaleString("en-NG", { dateStyle: "medium", timeStyle: "short" })} at ${normalizedLocation}. Your assessment fee is confirmed as paid; no payment upload is required.`,
       });
     } catch (smsError) {
       console.error("INSPECTION SCHEDULE SMS ERROR:", smsError.message);
     }
-    return res.json({ status: true, message: "Inspection scheduled. Email and SMS notifications were prepared for the customer.", loanRequest: sanitizeInstallerAssignment(loanRequest) });
+    return res.json({ status: true, message: "Inspection scheduled. The customer was notified that payment is already confirmed.", loanRequest: sanitizeInstallerAssignment(loanRequest) });
   } catch (error) {
     console.error("ACCEPT INSTALLER ASSIGNMENT ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not accept the inspection assignment." });
@@ -3541,24 +3766,88 @@ app.patch("/api/installer/assignments/:id/payment-received", requireInstallerAut
 
 app.patch("/api/installer/assignments/:id/decline", requireInstallerAuth, async (req, res) => {
   try {
-    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    const currentRevision = requiredAssignmentRevision(req, res);
+    if (currentRevision === null) return;
+    let loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
     if (!loanRequest || loanRequest.installerAssignment?.status !== "assigned") {
-      return res.status(404).json({ status: false, message: "This assignment is no longer available for decline." });
+      return assignmentChanged(res);
     }
     const previousInstaller = loanRequest.installerAssignment;
-    loanRequest.installerAssignment.history.push({ installer: previousInstaller.installer, installerName: previousInstaller.installerName, status: "declined", note: String(req.body.reason || "Installer declined the assignment."), changedAt: new Date() });
-    const replacement = await assignInstallerToLoanRequest(loanRequest, {
-      excludedIds: [previousInstaller.installer],
-      reassigned: true,
-      note: `Automatically reassigned after ${previousInstaller.installerName} declined.`,
-    });
-    if (!replacement) {
-      loanRequest.installerAssignment.status = "declined";
-      loanRequest.installerAssignment.declinedAt = new Date();
-      loanRequest.installerAssignment.declineReason = String(req.body.reason || "Installer declined the assignment.");
-      loanRequest.statusHistory.push({ status: loanRequest.status, source: "system", note: "No alternate active installer is available; admin reassignment is required." });
+    const reason = String(req.body.reason || "Installer declined the assignment.");
+    const replacement = await chooseInstaller([previousInstaller.installer]);
+    const now = new Date();
+    const assignmentHistory = [{
+      installer: previousInstaller.installer,
+      installerName: previousInstaller.installerName,
+      status: "declined",
+      note: reason,
+      changedAt: now,
+    }];
+    if (replacement) {
+      assignmentHistory.push({
+        installer: replacement._id,
+        installerName: replacement.fullName,
+        status: "assigned",
+        note: `Automatically reassigned after ${previousInstaller.installerName} declined.`,
+        changedAt: now,
+      });
     }
-    await loanRequest.save();
+    const update = replacement
+      ? {
+        $set: {
+          "installerAssignment.installer": replacement._id,
+          "installerAssignment.installerName": replacement.fullName,
+          "installerAssignment.installerEmail": replacement.email,
+          "installerAssignment.status": "assigned",
+          "installerAssignment.assignedAt": now,
+          "installerAssignment.acceptedAt": null,
+          "installerAssignment.declinedAt": null,
+          "installerAssignment.declineReason": "",
+          status: "internal-review",
+        },
+        $inc: {
+          "installerAssignment.reassignmentCount": 1,
+          "installerAssignment.revision": 1,
+        },
+        $push: {
+          "installerAssignment.history": { $each: assignmentHistory },
+          statusHistory: {
+            status: "internal-review",
+            source: "system",
+            note: `Inspection assigned to ${replacement.fullName} after ${previousInstaller.installerName} declined.`,
+            changedAt: now,
+          },
+        },
+      }
+      : {
+        $set: {
+          "installerAssignment.status": "declined",
+          "installerAssignment.declinedAt": now,
+          "installerAssignment.declineReason": reason,
+        },
+        $inc: { "installerAssignment.revision": 1 },
+        $push: {
+          "installerAssignment.history": { $each: assignmentHistory },
+          statusHistory: {
+            status: loanRequest.status,
+            source: "system",
+            note: "No alternate active installer is available; admin reassignment is required.",
+            changedAt: now,
+          },
+        },
+      };
+    const updated = await LoanRequest.findOneAndUpdate(
+      installerAssignmentWriteFilter({
+        projectId: req.params.id,
+        installerId: req.installer.id,
+        revision: currentRevision,
+        statuses: ["assigned"],
+      }),
+      update,
+      { new: true, runValidators: true },
+    );
+    if (!updated) return assignmentChanged(res);
+    loanRequest = updated;
     if (replacement) {
       try { await sendInstallerAssignmentEmail(loanRequest, replacement, true); } catch (mailError) { console.error("REASSIGNMENT EMAIL ERROR:", mailError.message); }
       try {
@@ -3578,9 +3867,18 @@ app.patch("/api/installer/assignments/:id/decline", requireInstallerAuth, async 
 
 app.patch("/api/installer/assignments/:id/report", requireInstallerAuth, async (req, res) => {
   try {
+    const currentRevision = requiredAssignmentRevision(req, res);
+    if (currentRevision === null) return;
     const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
     if (!loanRequest || !["accepted", "scheduled"].includes(loanRequest.installerAssignment?.status)) {
-      return res.status(404).json({ status: false, message: "Only an accepted inspection assignment can be updated." });
+      return assignmentChanged(res);
+    }
+    if (loanRequest.inspection?.feeStatus !== "payment-confirmed") {
+      return res.status(409).json({
+        status: false,
+        code: "ASSESSMENT_PAYMENT_NOT_CONFIRMED",
+        message: "The assessment payment has not been confirmed by sales. The field report cannot be submitted.",
+      });
     }
     const { inspection = {}, loadAudit = {}, dueDiligence = {}, siteDetails = {}, inspectionCosts = [] } = req.body;
     const copyFields = (target, source, fields) => fields.forEach((field) => {
@@ -3623,14 +3921,39 @@ app.patch("/api/installer/assignments/:id/report", requireInstallerAuth, async (
       loanRequest.assessment.status = "in-progress";
       loanRequest.status = auditPassed ? "load-audit-completed" : inspectionPassed ? "inspection-completed" : "inspection-scheduled";
     }
-    loanRequest.statusHistory.push({ status: loanRequest.status, source: "installer", note: `Inspection, load-audit, due-diligence, and material report updated by ${loanRequest.installerAssignment.installerName}.` });
-    await loanRequest.save();
+    const historyEntry = {
+      status: loanRequest.status,
+      source: "installer",
+      note: `Inspection, load-audit, due-diligence, and material report updated by ${loanRequest.installerAssignment.installerName}.`,
+      changedAt: new Date(),
+    };
+    const updated = await LoanRequest.findOneAndUpdate(
+      installerAssignmentWriteFilter({
+        projectId: req.params.id,
+        installerId: req.installer.id,
+        revision: currentRevision,
+        statuses: ["accepted", "scheduled"],
+      }),
+      {
+        $set: {
+          assessment: loanRequest.assessment.toObject(),
+          inspection: loanRequest.inspection.toObject(),
+          inspectionCosts: loanRequest.inspectionCosts.map((item) => item?.toObject ? item.toObject() : item),
+          "installerAssignment.status": loanRequest.installerAssignment.status,
+          status: loanRequest.status,
+        },
+        $inc: { "installerAssignment.revision": 1 },
+        $push: { statusHistory: historyEntry },
+      },
+      { new: true, runValidators: true },
+    );
+    if (!updated) return assignmentChanged(res);
     return res.json({
       status: true,
-      message: loanRequest.assessment.status === "passed"
+      message: updated.assessment.status === "passed"
         ? "Site assessment saved. Sales can now download the full report and prepare the quotation."
         : "Installer site-assessment report saved.",
-      loanRequest: sanitizeInstallerAssignment(loanRequest),
+      loanRequest: sanitizeInstallerAssignment(updated),
     });
   } catch (error) {
     console.error("INSTALLER REPORT ERROR:", error.message);

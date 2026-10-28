@@ -81,6 +81,20 @@ const deviceSchema = new mongoose.Schema(
       enum: ["unknown", "on", "off"],
       default: "unknown",
     },
+    // AshGridX controls whether the customer''s load is served by the
+    // generation output. It does not shut down the inverter itself.
+    loadServiceState: {
+      type: String,
+      enum: ["unknown", "connected", "disconnected"],
+      default: "unknown",
+    },
+    protectionState: {
+      type: String,
+      enum: ["unknown", "normal", "bypass"],
+      default: "unknown",
+    },
+    lastProviderEvent: { type: String, default: "", trim: true },
+    lastProviderEventAt: { type: Date, default: null },
     lastSeenAt: { type: Date, default: null },
     lastProviderSyncAt: { type: Date, default: null },
     lastCommandStatus: { type: String, default: "", trim: true },
@@ -120,6 +134,7 @@ const deviceSchema = new mongoose.Schema(
 
 deviceSchema.index({ customer: 1, assignmentStatus: 1 });
 deviceSchema.index({ connectivity: 1, "tamper.status": 1 });
+deviceSchema.index({ protectionState: 1, lastProviderEventAt: -1 });
 
 const Device = mongoose.model("Device", deviceSchema);
 

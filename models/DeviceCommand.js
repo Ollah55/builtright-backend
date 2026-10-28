@@ -16,7 +16,11 @@ const deviceCommandSchema = new mongoose.Schema(
       index: true,
     },
     deviceReference: { type: String, required: true, uppercase: true, trim: true },
-    action: { type: String, enum: ["on", "off"], required: true },
+    action: {
+      type: String,
+      enum: ["on", "off", "disconnect-load", "restore-load", "generate-activation-token"],
+      required: true,
+    },
     status: {
       type: String,
       enum: ["blocked", "pending", "accepted", "sent", "acknowledged", "executed", "failed", "timed-out", "offline", "cancelled"],
