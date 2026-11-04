@@ -6404,7 +6404,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-10-23-password-visibility-and-recovery-v2",
+    release: "2026-11-04-richgreen-continuation-v1",
     portalUrl: frontendUrl(),
   });
 });
