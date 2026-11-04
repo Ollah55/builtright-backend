@@ -129,6 +129,14 @@ const projectDocumentSchema = new mongoose.Schema(
       sentAt: { type: Date, default: null },
       error: { type: String, default: "", trim: true },
     },
+    uploadedFile: {
+      url: { type: String, default: "", trim: true },
+      publicId: { type: String, default: "", trim: true },
+      fileName: { type: String, default: "", trim: true },
+      mimeType: { type: String, default: "", trim: true },
+      uploadedAt: { type: Date, default: null },
+      uploadedBy: { type: String, default: "", trim: true },
+    },
     createdBy: { type: String, default: "BuiltRight operations", trim: true },
   },
   { timestamps: true }

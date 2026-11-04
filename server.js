@@ -3133,31 +3133,65 @@ app.get("/api/sales/projects", requireOperationsAuth, async (req, res) => {
   }
 });
 
-app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
+app.post("/api/sales/projects", requireOperationsAuth, upload.single("quotationFile"), async (req, res) => {
   try {
-    const { customer = {}, installerId, inspectionFeeAmount, paymentMethod, financeInstitution, systemDescription, notes, consentCaptured, inspectionCompleted, assessmentFeePaid } = req.body;
+    let input = req.body;
+    if (req.body?.payload) {
+      try {
+        input = JSON.parse(req.body.payload);
+      } catch {
+        return res.status(400).json({ status: false, message: "The customer onboarding details could not be read." });
+      }
+    }
+    const { customer = {}, installerId, inspectionFeeAmount, paymentMethod, financeInstitution, systemDescription, systemCapacity, quotationTotal, quotationAccepted, notes, consentCaptured, inspectionCompleted, assessmentFeePaid } = input;
     if (!customer.fullName || !customer.email || !customer.phone || !customer.location) {
       return res.status(400).json({ status: false, message: "Customer name, email, phone number, and project location are required." });
     }
     if (!consentCaptured) {
       return res.status(400).json({ status: false, message: "Confirm that the customer consented to BuiltRight recording and using the supplied project information." });
     }
-    const completedOffline = Boolean(inspectionCompleted);
-    const paymentConfirmed = completedOffline || Boolean(assessmentFeePaid);
-    if (!completedOffline && !paymentConfirmed) {
+    const acceptedQuotation = Boolean(quotationAccepted);
+    const completedOffline = Boolean(inspectionCompleted) || acceptedQuotation;
+    const paymentConfirmed = Boolean(assessmentFeePaid);
+    if (!paymentConfirmed) {
       return res.status(400).json({
         status: false,
-        message: "Confirm that the assessment fee has been received before assigning an installer.",
+        message: "Confirm that the assessment fee has been received before recording any later step.",
       });
     }
     if (!completedOffline && !installerId) return res.status(400).json({ status: false, message: "Select the installer who will perform the site assessment." });
     const normalizedFee = Number(String(inspectionFeeAmount ?? "").replace(/[^\d.]/g, ""));
-    if (!completedOffline && !(normalizedFee > 0)) return res.status(400).json({ status: false, message: "Enter an assessment fee greater than zero." });
+    if (!(normalizedFee > 0)) return res.status(400).json({ status: false, message: "Enter the confirmed assessment fee received." });
     const selectedPaymentMethod = paymentMethod === "outright" ? "outright" : "bank-financing";
     const selectedFinanceInstitution = selectedPaymentMethod === "outright" ? "Not applicable — outright payment" : (financeInstitution || "Bank partner pending");
+    const normalizedQuotationTotal = Number(String(quotationTotal ?? "").replace(/[^\d.]/g, ""));
+    if (acceptedQuotation && (selectedPaymentMethod !== "bank-financing" || !/richgreen/i.test(selectedFinanceInstitution))) {
+      return res.status(400).json({ status: false, message: "The direct application-continuation stage is currently available only for RichGreen bank financing." });
+    }
+    if (acceptedQuotation && (!(normalizedQuotationTotal > 0) || !String(systemDescription || "").trim())) {
+      return res.status(400).json({ status: false, message: "Enter the accepted quotation total and the approved solar system." });
+    }
+    if (acceptedQuotation && (!req.file || req.file.mimetype !== "application/pdf")) {
+      return res.status(400).json({ status: false, message: "Upload the customer's accepted quotation as a PDF." });
+    }
+    if (acceptedQuotation && req.file.size > 12 * 1024 * 1024) {
+      return res.status(400).json({ status: false, message: "The accepted quotation PDF must be 12 MB or smaller." });
+    }
+    const customerEmail = String(customer.email).toLowerCase().trim();
+    const existingCustomerAccount = await User.findOne({ email: customerEmail });
+    if (existingCustomerAccount && existingCustomerAccount.role !== "customer") {
+      return res.status(409).json({ status: false, message: "This email belongs to a non-customer account. Use a different customer email address." });
+    }
     const equityPercentage = selectedPaymentMethod === "outright" ? 100 : (selectedFinanceInstitution === "LOTUS Bank" ? 10 : 20);
     const salesUser = await User.findById(req.staff.id).select("fullName email").lean();
     const salesName = salesUser?.fullName || req.staff.fullName || req.staff.email;
+    let uploadedQuotation = null;
+    if (acceptedQuotation) {
+      uploadedQuotation = await cloudinary.uploader.upload(
+        `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`,
+        { folder: "builtright/accepted-quotations", resource_type: "auto" }
+      );
+    }
     const loanRequest = await LoanRequest.create({
       customer: {
         fullName: String(customer.fullName).trim(),
@@ -3170,13 +3204,13 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
       paymentMethod: selectedPaymentMethod,
       installationProvider: "BuiltRight Services Ltd",
       financeInstitution: selectedFinanceInstitution,
-      items: [{ id: `sales-${Date.now()}`, name: String(systemDescription || "System to be finalized after site assessment"), quantity: 1, price: null, category: "solar-system", type: "Sales-assisted enquiry", capacity: "" }],
+      items: [{ id: `sales-${Date.now()}`, name: String(systemDescription || "System to be finalized after site assessment"), quantity: 1, price: acceptedQuotation ? normalizedQuotationTotal : null, category: "solar-system", type: "Sales-assisted enquiry", capacity: String(systemCapacity || "") }],
       consentToShare: true,
       preferredContact: "WhatsApp",
       bankApplication: { provider: selectedFinanceInstitution, status: selectedPaymentMethod === "outright" ? "not-required" : "not-started" },
       deposit: { percentage: equityPercentage, status: "not-due" },
       assessment: {
-        status: completedOffline ? "in-progress" : "open",
+        status: acceptedQuotation ? "passed" : completedOffline ? "in-progress" : "open",
         triggeredAt: new Date(),
         inspection: completedOffline
           ? { status: "completed", result: "pass", completedAt: new Date(), completedBy: salesName, notes: "Site inspection was completed and confirmed through the offline/WhatsApp sales process." }
@@ -3191,14 +3225,16 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
             : "Projected load discussion completed by sales on WhatsApp. Installer will record the verified on-site load audit.",
         },
         dueDiligence: {
-          status: "pending",
-          result: "pending",
+          status: acceptedQuotation ? "completed" : "pending",
+          result: acceptedQuotation ? "pass" : "pending",
+          completedAt: acceptedQuotation ? new Date() : null,
+          completedBy: acceptedQuotation ? salesName : "",
           checklist: [
-            { key: "identity-contact", label: "Customer identity and contact verified", status: "pending" },
-            { key: "property-authority", label: "Property ownership or installation authority verified", status: "pending" },
-            { key: "site-access", label: "Site access and installation permissions confirmed", status: "pending" },
-            { key: "technical-suitability", label: "Roof, electrical, and structural suitability confirmed", status: "pending" },
-            { key: "financing-consent", label: "Financing data-sharing consent recorded", status: "pending" },
+            { key: "identity-contact", label: "Customer identity and contact verified", status: acceptedQuotation ? "pass" : "pending" },
+            { key: "property-authority", label: "Property ownership or installation authority verified", status: acceptedQuotation ? "pass" : "pending" },
+            { key: "site-access", label: "Site access and installation permissions confirmed", status: acceptedQuotation ? "pass" : "pending" },
+            { key: "technical-suitability", label: "Roof, electrical, and structural suitability confirmed", status: acceptedQuotation ? "pass" : "pending" },
+            { key: "financing-consent", label: "Financing data-sharing consent recorded", status: acceptedQuotation ? "pass" : "pending" },
           ],
         },
       },
@@ -3207,11 +3243,15 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
         paymentConfirmed,
         completed: completedOffline,
       }),
-      status: completedOffline ? "inspection-completed" : "submitted",
+      estimatedAmount: acceptedQuotation ? normalizedQuotationTotal : null,
+      finalProjectCost: acceptedQuotation ? normalizedQuotationTotal : null,
+      status: acceptedQuotation ? "quotation-approved" : completedOffline ? "inspection-completed" : "submitted",
       statusHistory: [{
-        status: completedOffline ? "inspection-completed" : "submitted",
+        status: acceptedQuotation ? "quotation-approved" : completedOffline ? "inspection-completed" : "submitted",
         source: "sales",
-        note: completedOffline
+        note: acceptedQuotation
+          ? `Customer registered by ${salesName} at the existing quotation-approved stage for RichGreen application continuation.`
+          : completedOffline
           ? `Customer registered by ${salesName}; offline/WhatsApp inspection, load audit, and assessment payment recorded as completed.`
           : `Customer assessment booking created by ${salesName}; assessment payment received and confirmed by sales before installer assignment.`,
       }],
@@ -3238,7 +3278,7 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
           phone: loanRequest.customer.phone,
         },
         items: loanRequest.items,
-        amount: null,
+        amount: acceptedQuotation ? normalizedQuotationTotal : null,
         date: new Date().toLocaleDateString("en-NG"),
         status: "Processing",
         financingRequestId: loanRequest._id,
@@ -3247,13 +3287,96 @@ app.post("/api/sales/projects", requireOperationsAuth, async (req, res) => {
       await LoanRequest.deleteOne({ _id: loanRequest._id });
       throw orderError;
     }
+    let approvedQuotation = null;
+    if (acceptedQuotation) {
+      const approvedAt = new Date();
+      const equityAmount = Number((normalizedQuotationTotal * equityPercentage / 100).toFixed(2));
+      approvedQuotation = await ProjectDocument.create({
+        reference: `BRQ-${String(loanRequest.reference).replace(/^BRF-/, "")}-V1`,
+        financingRequest: loanRequest._id,
+        order: order._id,
+        type: "quotation",
+        purpose: "project",
+        version: 1,
+        status: "approved",
+        title: `${String(systemDescription).trim()} project quotation`,
+        customer: loanRequest.customer,
+        project: {
+          systemName: String(systemDescription).trim(),
+          systemCapacity: String(systemCapacity || "").trim(),
+          siteAddress: loanRequest.customer.location,
+          scope: "Existing BuiltRight quotation recorded by sales after customer acceptance.",
+        },
+        lineItems: [{ category: "solar-system", description: String(systemDescription).trim(), quantity: 1, unit: "project", unitPrice: normalizedQuotationTotal, amount: normalizedQuotationTotal, source: "manual" }],
+        subtotal: normalizedQuotationTotal,
+        total: normalizedQuotationTotal,
+        equityPercentage,
+        equityAmount,
+        bankFinanceAmount: Number((normalizedQuotationTotal - equityAmount).toFixed(2)),
+        sentAt: approvedAt,
+        emailDelivery: { status: "sent", sentAt: approvedAt, error: "Recorded from an existing accepted quotation." },
+        customerDecision: { status: "approved", decidedAt: approvedAt, note: "Customer acceptance confirmed and recorded by the sales team." },
+        bankDelivery: { status: "pending", sentAt: null, error: "" },
+        uploadedFile: {
+          url: uploadedQuotation.secure_url,
+          publicId: uploadedQuotation.public_id,
+          fileName: req.file.originalname,
+          mimeType: req.file.mimetype,
+          uploadedAt: approvedAt,
+          uploadedBy: salesName,
+        },
+        createdBy: salesName,
+      });
+      loanRequest.quotation = { status: "approved", document: approvedQuotation._id, reference: approvedQuotation.reference, version: 1, sentAt: approvedAt, approvedAt, changesRequestedAt: null };
+      loanRequest.bankApplication.status = "manual-application-ready";
+      loanRequest.bankApplication.quotationDocument = approvedQuotation._id;
+      loanRequest.bankApplication.customerApprovedAt = approvedAt;
+      loanRequest.bankApplication.richGreenApplication = { status: "ready", submittedAt: null, submittedBy: "", quotationDocument: approvedQuotation._id, data: null };
+      loanRequest.items = [{ ...loanRequest.items[0].toObject(), name: String(systemDescription).trim(), capacity: String(systemCapacity || "").trim(), price: normalizedQuotationTotal }];
+      await loanRequest.save();
+    }
     if (installer) {
       try { await sendInstallerAssignmentEmail(loanRequest, installer); } catch (mailError) { console.error("SALES ASSIGNMENT EMAIL ERROR:", mailError.message); }
     }
-    try { await sendSubmissionConfirmationEmail(loanRequest, order); } catch (mailError) { console.error("SALES CUSTOMER CONFIRMATION ERROR:", mailError.message); }
+    if (acceptedQuotation) {
+      try {
+        let account = existingCustomerAccount;
+        let continuationUrl = `${frontendUrl()}/auth`;
+        let accountInstruction = `Sign in with your existing BuiltRight customer account, then open Documents to complete the RichGreen application.`;
+        if (!account) {
+          const rawToken = crypto.randomBytes(32).toString("hex");
+          const temporaryPassword = crypto.randomBytes(24).toString("base64url");
+          account = await User.create({
+            fullName: loanRequest.customer.fullName,
+            email: loanRequest.customer.email,
+            phone: loanRequest.customer.phone,
+            location: loanRequest.customer.location,
+            password: await bcrypt.hash(temporaryPassword, 12),
+            role: "customer",
+            isActive: true,
+            passwordResetTokenHash: passwordResetTokenHash(rawToken),
+            passwordResetExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+            passwordResetSentAt: new Date(),
+          });
+          continuationUrl = `${frontendUrl()}/reset-password?token=${encodeURIComponent(rawToken)}`;
+          accountInstruction = "Set your BuiltRight password, sign in, then open Documents to complete the RichGreen application.";
+        }
+        await sendEmail({
+          to: account.email,
+          subject: `Continue your RichGreen application - ${approvedQuotation.reference}`,
+          html: `<h2>Your BuiltRight financing application is ready</h2><p>Hello ${safeHtml(account.fullName)},</p><p>Your accepted quotation <strong>${safeHtml(approvedQuotation.reference)}</strong> for <strong>${safeHtml(systemDescription)}</strong> has been recorded.</p><p>${safeHtml(accountInstruction)}</p><p><a href="${continuationUrl}">Continue my application</a></p><p>Your information will be submitted securely to BuiltRight. Our sales team will download the completed application and forward it to RichGreen with your approved quotation.</p>`,
+        });
+      } catch (accessError) {
+        console.error("CUSTOMER APPLICATION ACCESS EMAIL ERROR:", accessError.message);
+      }
+    } else {
+      try { await sendSubmissionConfirmationEmail(loanRequest, order); } catch (mailError) { console.error("SALES CUSTOMER CONFIRMATION ERROR:", mailError.message); }
+    }
     return res.status(201).json({
       status: true,
-      message: completedOffline
+      message: acceptedQuotation
+        ? `Customer added at quotation-approved stage. An email was sent so they can continue the RichGreen application.`
+        : completedOffline
         ? `Customer registered, offline assessment recorded, and order ${order.orderNumber} created.`
         : `Customer registered, payment confirmed, order ${order.orderNumber} created, and site assessment assigned to ${installer.fullName}.`,
       loanRequest,
@@ -5889,6 +6012,9 @@ app.get("/api/customer/documents/:id/download", requireCustomerAuth, async (req,
     if (!projectDocument) {
       return res.status(404).json({ status: false, message: "Document not found." });
     }
+    if (projectDocument.uploadedFile?.url) {
+      return res.redirect(projectDocument.uploadedFile.url);
+    }
 
     const pdf = buildProjectDocumentPdf(projectDocument);
     const documentLabel = projectDocument.type === "invoice" ? "Invoice" : "Quotation";
@@ -6116,6 +6242,16 @@ app.post("/api/customer/financing/:id/richgreen-application", requireCustomerAut
     };
     loanRequest.statusHistory.push({ status: loanRequest.status, source: "customer", note: `Customer submitted the RichGreen application for quotation ${quotation.reference}.` });
     await loanRequest.save();
+    try {
+      const notificationEmail = process.env.BUILTRIGHT_APPLICATION_EMAIL || process.env.ADMIN_EMAIL || loanRequest.intake?.createdByEmail || "info@builtrightltd.com";
+      await sendEmail({
+        to: notificationEmail,
+        subject: `RichGreen application submitted - ${loanRequest.reference}`,
+        html: `<h2>RichGreen customer application submitted</h2><p><strong>Customer:</strong> ${safeHtml(application.fullName)}</p><p><strong>BuiltRight project:</strong> ${safeHtml(loanRequest.reference)}</p><p><strong>Quotation:</strong> ${safeHtml(quotation.reference)}</p><p>The completed application is stored securely. Sign in to the sales portal to download the application PDF and forward it to RichGreen with the approved quotation.</p><p><a href="${frontendUrl()}/sales/projects/${loanRequest._id}">Open customer project</a></p>`,
+      });
+    } catch (mailError) {
+      console.error("RICHGREEN APPLICATION NOTIFICATION EMAIL ERROR:", mailError.message);
+    }
     return res.json({
       status: true,
       message: "RichGreen application submitted securely. The sales team can now download it from the portal and forward it to the bank with your approved quotation.",
