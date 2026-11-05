@@ -6439,7 +6439,7 @@ app.post("/api/customer/financing/:id/richgreen-application", requireCustomerAut
       employerBusinessName: clean(source.employerBusinessName),
       officeBusinessAddress: clean(source.officeBusinessAddress),
       positionBusinessType: clean(source.positionBusinessType),
-      monthlyNetIncome: Number(source.monthlyNetIncome || 0),
+      monthlyNetIncome: Number(String(source.monthlyNetIncome || "").replace(/[^\d.]/g, "")) || 0,
       yearsInEmploymentBusiness: clean(source.yearsInEmploymentBusiness),
       bankName: clean(source.bankName),
       accountNumber: clean(source.accountNumber).replace(/\D/g, ""),
@@ -6664,7 +6664,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-11-05-richgreen-application-email-v1",
+    release: "2026-11-05-richgreen-income-field-v1",
     portalUrl: frontendUrl(),
   });
 });
