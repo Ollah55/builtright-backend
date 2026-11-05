@@ -40,6 +40,10 @@ import {
   assessmentPaymentState,
   initialAssessmentInspection,
 } from "./utils/assessmentPayment.js";
+import {
+  installationSchedulingGate,
+  installationTransition,
+} from "./utils/installationWorkflow.js";
 
 dotenv.config();
 
@@ -2504,6 +2508,42 @@ const sendCompletedInstallerProjectNotification = async (loanRequest, installer,
   if (emailOutcome.status === "rejected") throw emailOutcome.reason;
 };
 
+const sendInstallerInstallationReadyNotification = async (loanRequest, installer) => {
+  const profileUrl = `${frontendUrl()}/installer/assignments`;
+  const emailResult = sendEmail({
+    to: installer.email,
+    subject: `Funds received - schedule installation for ${loanRequest.reference}`,
+    html: `<h2>Project cleared for installation</h2><p>Hello ${safeHtml(installer.fullName)},</p><p>BuiltRight has confirmed receipt of the financing disbursement for ${safeHtml(loanRequest.customer.fullName)}'s project.</p><ul><li><strong>Reference:</strong> ${safeHtml(loanRequest.reference)}</li><li><strong>Customer phone:</strong> ${safeHtml(loanRequest.customer.phone)}</li><li><strong>Installation location:</strong> ${safeHtml(loanRequest.customer.location || "To be confirmed")}</li></ul><p>Sign in to your installer profile, contact the customer, and schedule the installation. Do not schedule installation before this disbursement clearance.</p><p><a href="${profileUrl}">Schedule installation</a></p>`,
+  });
+  const smsResult = installer.phone
+    ? sendSms({
+      to: installer.phone,
+      message: `BuiltRight: Funds received for ${loanRequest.reference}, ${loanRequest.customer.fullName}. Installation scheduling is now unlocked. Log in: ${profileUrl}`,
+    })
+    : Promise.resolve({ status: "missing-phone" });
+  const [emailOutcome, smsOutcome] = await Promise.allSettled([emailResult, smsResult]);
+  if (smsOutcome.status === "rejected") console.error("INSTALLATION READY SMS ERROR:", smsOutcome.reason?.message || smsOutcome.reason);
+  if (emailOutcome.status === "rejected") throw emailOutcome.reason;
+};
+
+const notifyCustomerOfInstallationUpdate = async (loanRequest, title, message) => {
+  const portalUrl = `${frontendUrl()}/customer/financing`;
+  const emailResult = sendEmail({
+    to: loanRequest.customer.email,
+    subject: `BuiltRight installation update - ${title}`,
+    html: `<h2>${safeHtml(title)}</h2><p>Hello ${safeHtml(loanRequest.customer.fullName)},</p><p>${safeHtml(message)}</p><p><strong>Project reference:</strong> ${safeHtml(loanRequest.reference)}</p><p><a href="${portalUrl}">View project progress</a></p>`,
+  });
+  const smsResult = loanRequest.customer.phone
+    ? sendSms({
+      to: loanRequest.customer.phone,
+      message: `BuiltRight ${loanRequest.reference}: ${message} Track progress: ${portalUrl}`,
+    })
+    : Promise.resolve({ status: "missing-phone" });
+  const [emailOutcome, smsOutcome] = await Promise.allSettled([emailResult, smsResult]);
+  if (smsOutcome.status === "rejected") console.error("CUSTOMER INSTALLATION SMS ERROR:", smsOutcome.reason?.message || smsOutcome.reason);
+  if (emailOutcome.status === "rejected") throw emailOutcome.reason;
+};
+
 const sanitizeInstallerAssignment = (loanRequest) => {
   const value = loanRequest?.toObject ? loanRequest.toObject() : { ...loanRequest };
   return {
@@ -2997,7 +3037,6 @@ app.delete("/api/loan-requests/:id", requireAdminAuth, async (req, res) => {
         message: "Loan request not found.",
       });
     }
-
     const linkedDevices = await Device.find({ financingRequest: loanRequest._id }).select("_id").lean();
     const deviceIds = linkedDevices.map((device) => device._id);
     await Promise.all([
@@ -4146,6 +4185,136 @@ app.patch("/api/installer/assignments/:id/report", requireInstallerAuth, async (
   }
 });
 
+app.patch("/api/installer/assignments/:id/installation/schedule", requireInstallerAuth, async (req, res) => {
+  try {
+    const currentRevision = requiredAssignmentRevision(req, res);
+    if (currentRevision === null) return;
+    const scheduledAt = new Date(String(req.body.scheduledAt || ""));
+    if (Number.isNaN(scheduledAt.getTime()) || scheduledAt <= new Date()) {
+      return res.status(400).json({ status: false, message: "Choose a future installation date and time." });
+    }
+    const note = String(req.body.notes || "").trim().slice(0, 1000);
+    const loanRequest = await LoanRequest.findOne({
+      _id: req.params.id,
+      "installerAssignment.installer": req.installer.id,
+    });
+    if (!loanRequest) return assignmentChanged(res);
+    const schedulingGate = installationSchedulingGate({
+      assignmentStatus: loanRequest.installerAssignment?.status,
+      projectStatus: loanRequest.status,
+      bankStatus: loanRequest.bankApplication?.status,
+    });
+    if (!schedulingGate.allowed) {
+      return res.status(409).json({
+        status: false,
+        code: "DISBURSEMENT_REQUIRED",
+        message: "Installation scheduling unlocks only after BuiltRight confirms receipt of the bank disbursement.",
+      });
+    }
+    const now = new Date();
+    const installerName = loanRequest.installerAssignment.installerName;
+    const baseFilter = installerAssignmentWriteFilter({
+      projectId: req.params.id,
+      installerId: req.installer.id,
+      revision: currentRevision,
+      statuses: ["completed"],
+    });
+    const updated = await LoanRequest.findOneAndUpdate(
+      {
+        $and: [
+          baseFilter,
+          { $or: [{ "installation.status": { $in: ["not-ready", "ready-to-schedule"] } }, { "installation.status": { $exists: false } }] },
+        ],
+        status: { $in: ["disbursed", "order-created"] },
+        "bankApplication.status": "disbursed",
+      },
+      {
+        $set: {
+          "installation.status": "scheduled",
+          "installation.scheduledAt": scheduledAt,
+          "installation.notes": note,
+          "installation.updatedBy": installerName,
+          status: "installation-scheduled",
+        },
+        $inc: { "installerAssignment.revision": 1 },
+        $push: {
+          "installation.history": { status: "scheduled", note: note || "Installation date agreed with the customer.", changedAt: now, changedBy: installerName },
+          statusHistory: { status: "installation-scheduled", source: "installer", note: `Installation scheduled by ${installerName}.`, changedAt: now },
+        },
+      },
+      { new: true, runValidators: true },
+    );
+    if (!updated) return assignmentChanged(res);
+    try {
+      await notifyCustomerOfInstallationUpdate(
+        updated,
+        "Installation scheduled",
+        `${installerName} scheduled your installation for ${scheduledAt.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short" })}.`,
+      );
+    } catch (mailError) {
+      console.error("INSTALLATION SCHEDULE CUSTOMER NOTIFICATION ERROR:", mailError.message);
+    }
+    return res.json({ status: true, message: "Installation scheduled and the customer has been notified.", loanRequest: sanitizeInstallerAssignment(updated) });
+  } catch (error) {
+    console.error("SCHEDULE INSTALLATION ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not schedule the installation." });
+  }
+});
+
+app.patch("/api/installer/assignments/:id/installation/status", requireInstallerAuth, async (req, res) => {
+  try {
+    const currentRevision = requiredAssignmentRevision(req, res);
+    if (currentRevision === null) return;
+    const nextStatus = String(req.body.status || "").trim();
+    const transition = installationTransition(nextStatus);
+    if (!transition) return res.status(400).json({ status: false, message: "Choose a valid installation progress stage." });
+    const loanRequest = await LoanRequest.findOne({ _id: req.params.id, "installerAssignment.installer": req.installer.id });
+    if (!loanRequest || loanRequest.installerAssignment?.status !== "completed") return assignmentChanged(res);
+    if (loanRequest.bankApplication?.status !== "disbursed") {
+      return res.status(409).json({ status: false, code: "DISBURSEMENT_REQUIRED", message: "Installation updates remain locked until BuiltRight confirms the bank disbursement." });
+    }
+    const note = String(req.body.notes || "").trim().slice(0, 1000);
+    const now = new Date();
+    const installerName = loanRequest.installerAssignment.installerName;
+    const setFields = {
+      "installation.status": nextStatus,
+      "installation.notes": note || loanRequest.installation?.notes || "",
+      "installation.updatedBy": installerName,
+      [`installation.${transition.timestamp}`]: now,
+      status: transition.projectStatus,
+    };
+    if (nextStatus === "completed") setFields["installation.commissionedAt"] = now;
+    const updated = await LoanRequest.findOneAndUpdate(
+      {
+        ...installerAssignmentWriteFilter({ projectId: req.params.id, installerId: req.installer.id, revision: currentRevision, statuses: ["completed"] }),
+        "installation.status": transition.from,
+      },
+      {
+        $set: setFields,
+        $inc: { "installerAssignment.revision": 1 },
+        $push: {
+          "installation.history": { status: nextStatus, note: note || transition.message, changedAt: now, changedBy: installerName },
+          statusHistory: { status: transition.projectStatus, source: "installer", note: `${transition.message} Updated by ${installerName}.`, changedAt: now },
+        },
+      },
+      { new: true, runValidators: true },
+    );
+    if (!updated) return assignmentChanged(res);
+    if (nextStatus === "completed") {
+      await Order.findOneAndUpdate({ financingRequestId: updated._id }, { $set: { status: "Delivered" } });
+    }
+    try {
+      await notifyCustomerOfInstallationUpdate(updated, nextStatus === "completed" ? "Project completed" : nextStatus === "testing-commissioning" ? "Testing and commissioning" : "Installation started", transition.message);
+    } catch (mailError) {
+      console.error("INSTALLATION PROGRESS CUSTOMER NOTIFICATION ERROR:", mailError.message);
+    }
+    return res.json({ status: true, message: transition.message, loanRequest: sanitizeInstallerAssignment(updated) });
+  } catch (error) {
+    console.error("UPDATE INSTALLATION STATUS ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not update the installation progress." });
+  }
+});
+
 app.patch("/api/loan-requests/:id/assessment", requireOperationsAuth, async (req, res) => {
   try {
     const loanRequest = await LoanRequest.findById(req.params.id);
@@ -4578,6 +4747,7 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
         message: "Loan request not found.",
       });
     }
+    const previousStatus = loanRequest.status;
 
     const workflowManagedStatuses = [
       "inspection-completed",
@@ -4588,12 +4758,15 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
       "quotation-sent",
       "quotation-approved",
       "quotation-prepared",
+      "installation-scheduled",
+      "installation-in-progress",
+      "completed",
     ];
     if (workflowManagedStatuses.includes(status)) {
       return res.status(409).json({
         status: false,
         code: "DEDICATED_WORKFLOW_REQUIRED",
-        message: "This stage is controlled by the assessment, quotation, or customer-approval workflow.",
+        message: "This stage is controlled by the assessment, quotation, customer-approval, or installer workflow.",
       });
     }
 
@@ -4629,6 +4802,21 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
     let createdInvoice = null;
 
     if (status === "disbursed") {
+      const disbursedAt = new Date();
+      loanRequest.bankApplication.status = "disbursed";
+      loanRequest.bankApplication.disbursedAt = disbursedAt;
+      loanRequest.bankApplication.disbursedAmount = Number(
+        loanRequest.finalProjectCost || loanRequest.estimatedAmount || 0
+      ) - Number(loanRequest.deposit?.amount || 0);
+      loanRequest.installation ||= {};
+      loanRequest.installation.history ||= [];
+      loanRequest.installation.status = "ready-to-schedule";
+      loanRequest.installation.history.push({
+        status: "ready-to-schedule",
+        note: "BuiltRight confirmed receipt of the bank disbursement. Installation scheduling unlocked.",
+        changedAt: disbursedAt,
+        changedBy: req.admin?.email || "BuiltRight operations",
+      });
       const financingReference = `FIN-${loanRequest.reference || loanRequest._id}`;
 
       const existingOrder = await Order.findOne({
@@ -4776,6 +4964,19 @@ app.patch("/api/loan-requests/:id/status", requireAdminAuth, async (req, res) =>
           : "Financing stage updated from the operations portal.",
     });
     await loanRequest.save();
+
+    if (status === "disbursed" && previousStatus !== "disbursed" && loanRequest.installerAssignment?.installer) {
+      try {
+        const assignedInstaller = await User.findOne({
+          _id: loanRequest.installerAssignment.installer,
+          role: "installer",
+          isActive: true,
+        });
+        if (assignedInstaller) await sendInstallerInstallationReadyNotification(loanRequest, assignedInstaller);
+      } catch (installerNoticeError) {
+        console.error("INSTALLATION READY INSTALLER NOTIFICATION ERROR:", installerNoticeError.message);
+      }
+    }
 
     try {
   const statusMessages = {
@@ -6457,7 +6658,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-11-05-sales-installer-attribution-v2",
+    release: "2026-11-05-disbursement-gated-installation-v1",
     portalUrl: frontendUrl(),
   });
 });

@@ -229,6 +229,32 @@ const loanRequestSchema = new mongoose.Schema(
       paymentConfirmedAt: { type: Date, default: null },
     },
 
+    installation: {
+      status: {
+        type: String,
+        enum: ["not-ready", "ready-to-schedule", "scheduled", "in-progress", "testing-commissioning", "completed"],
+        default: "not-ready",
+      },
+      scheduledAt: { type: Date, default: null },
+      startedAt: { type: Date, default: null },
+      testingStartedAt: { type: Date, default: null },
+      commissionedAt: { type: Date, default: null },
+      completedAt: { type: Date, default: null },
+      notes: { type: String, default: "", trim: true },
+      updatedBy: { type: String, default: "", trim: true },
+      history: {
+        type: [
+          {
+            status: { type: String, default: "not-ready" },
+            note: { type: String, default: "" },
+            changedAt: { type: Date, default: Date.now },
+            changedBy: { type: String, default: "" },
+          },
+        ],
+        default: [],
+      },
+    },
+
     installerAssignment: {
       installer: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
       installerName: { type: String, default: "", trim: true },
