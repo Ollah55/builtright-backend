@@ -2483,6 +2483,27 @@ const sendInstallerAssignmentEmail = async (loanRequest, installer, reassigned =
   if (emailOutcome.status === "rejected") throw emailOutcome.reason;
 };
 
+const sendCompletedInstallerProjectNotification = async (loanRequest, installer, quotationAccepted = false) => {
+  const profileUrl = `${frontendUrl()}/installer/assignments`;
+  const completedStage = quotationAccepted
+    ? "The assessment is recorded as completed and the customer has already accepted the quotation."
+    : "The assessment is recorded as completed through the offline/WhatsApp process.";
+  const emailResult = sendEmail({
+    to: installer.email,
+    subject: `Completed project added to your installer profile - ${loanRequest.reference}`,
+    html: `<h2>Completed customer project recorded</h2><p>Hello ${safeHtml(installer.fullName)},</p><p>BuiltRight sales has recorded you as the installer who handled ${safeHtml(loanRequest.customer.fullName)}'s project outside the portal.</p><ul><li><strong>Reference:</strong> ${safeHtml(loanRequest.reference)}</li><li><strong>Customer phone:</strong> ${safeHtml(loanRequest.customer.phone)}</li><li><strong>Project location:</strong> ${safeHtml(loanRequest.customer.location || "To be confirmed")}</li><li><strong>Current stage:</strong> ${safeHtml(completedStage)}</li></ul><p>This is a record notification only. You do not need to accept or schedule another inspection. The project is now visible in your installer profile for reference.</p><p><a href="${profileUrl}">Open installer profile</a></p>`,
+  });
+  const smsResult = installer.phone
+    ? sendSms({
+      to: installer.phone,
+      message: `BuiltRight: Completed project ${loanRequest.reference} for ${loanRequest.customer.fullName} has been added to your installer profile. No new inspection scheduling is required. View: ${profileUrl}`,
+    })
+    : Promise.resolve({ status: "missing-phone" });
+  const [emailOutcome, smsOutcome] = await Promise.allSettled([emailResult, smsResult]);
+  if (smsOutcome.status === "rejected") console.error("COMPLETED INSTALLER PROJECT SMS ERROR:", smsOutcome.reason?.message || smsOutcome.reason);
+  if (emailOutcome.status === "rejected") throw emailOutcome.reason;
+};
+
 const sanitizeInstallerAssignment = (loanRequest) => {
   const value = loanRequest?.toObject ? loanRequest.toObject() : { ...loanRequest };
   return {
@@ -3362,8 +3383,13 @@ app.post("/api/sales/projects", requireOperationsAuth, upload.single("quotationF
       loanRequest.items = [{ ...loanRequest.items[0].toObject(), name: String(systemDescription).trim(), capacity: String(systemCapacity || "").trim(), price: normalizedQuotationTotal }];
       await loanRequest.save();
     }
-    if (installer && !completedOffline) {
-      try { await sendInstallerAssignmentEmail(loanRequest, installer); } catch (mailError) { console.error("SALES ASSIGNMENT EMAIL ERROR:", mailError.message); }
+    if (installer) {
+      try {
+        if (completedOffline) await sendCompletedInstallerProjectNotification(loanRequest, installer, acceptedQuotation);
+        else await sendInstallerAssignmentEmail(loanRequest, installer);
+      } catch (mailError) {
+        console.error(completedOffline ? "COMPLETED INSTALLER PROJECT EMAIL ERROR:" : "SALES ASSIGNMENT EMAIL ERROR:", mailError.message);
+      }
     }
     if (acceptedQuotation) {
       try {
@@ -6431,7 +6457,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-11-05-sales-installer-attribution-v1",
+    release: "2026-11-05-sales-installer-attribution-v2",
     portalUrl: frontendUrl(),
   });
 });
