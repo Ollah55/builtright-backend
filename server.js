@@ -2544,22 +2544,25 @@ const assignInstallerToLoanRequest = async (loanRequest, { excludedIds = [], rea
   return installer;
 };
 
-const assignSpecificInstallerToLoanRequest = async (loanRequest, installerId, assignedBy = "BuiltRight sales") => {
-  const installer = await User.findOne({
+const assignSpecificInstallerToLoanRequest = async (loanRequest, installerId, assignedBy = "BuiltRight sales", options = {}) => {
+  const completedOutsidePortal = Boolean(options.completedOutsidePortal);
+  const installerQuery = {
     _id: installerId,
     role: "installer",
     isActive: true,
-    "installerProfile.availability": "available",
-  });
+  };
+  if (!completedOutsidePortal) installerQuery["installerProfile.availability"] = "available";
+  const installer = await User.findOne(installerQuery);
   if (!installer) return null;
+  const now = new Date();
   const previousHistory = loanRequest.installerAssignment?.history || [];
   loanRequest.installerAssignment = {
     installer: installer._id,
     installerName: installer.fullName,
     installerEmail: installer.email,
-    status: "assigned",
-    assignedAt: new Date(),
-    acceptedAt: null,
+    status: completedOutsidePortal ? "completed" : "assigned",
+    assignedAt: now,
+    acceptedAt: completedOutsidePortal ? now : null,
     declinedAt: null,
     declineReason: "",
     reassignmentCount: Number(loanRequest.installerAssignment?.reassignmentCount || 0),
@@ -2567,17 +2570,27 @@ const assignSpecificInstallerToLoanRequest = async (loanRequest, installerId, as
     history: [...previousHistory, {
       installer: installer._id,
       installerName: installer.fullName,
-      status: "assigned",
-      note: `Manually assigned by ${assignedBy}.`,
-      changedAt: new Date(),
+      status: completedOutsidePortal ? "completed" : "assigned",
+      note: completedOutsidePortal
+        ? `Recorded by ${assignedBy} as the installer who completed the offline/WhatsApp assessment.`
+        : `Manually assigned by ${assignedBy}.`,
+      changedAt: now,
     }],
   };
-  loanRequest.status = "internal-review";
-  loanRequest.statusHistory.push({
-    status: "internal-review",
-    source: "sales",
-    note: `Site assessment assigned to ${installer.fullName} by ${assignedBy}.`,
-  });
+  if (completedOutsidePortal) {
+    loanRequest.statusHistory.push({
+      status: loanRequest.status,
+      source: "sales",
+      note: `${installer.fullName} recorded by ${assignedBy} as the installer who completed the offline/WhatsApp assessment.`,
+    });
+  } else {
+    loanRequest.status = "internal-review";
+    loanRequest.statusHistory.push({
+      status: "internal-review",
+      source: "sales",
+      note: `Site assessment assigned to ${installer.fullName} by ${assignedBy}.`,
+    });
+  }
   return installer;
 };
 
@@ -3076,7 +3089,6 @@ app.get("/api/sales/installers", requireOperationsAuth, async (req, res) => {
     const installers = await User.find({
       role: "installer",
       isActive: true,
-      "installerProfile.availability": "available",
     }).select("fullName email installerProfile.availability").sort({ fullName: 1 }).lean();
     return res.json({ status: true, installers });
   } catch (error) {
@@ -3159,7 +3171,14 @@ app.post("/api/sales/projects", requireOperationsAuth, upload.single("quotationF
         message: "Confirm that the assessment fee has been received before recording any later step.",
       });
     }
-    if (!completedOffline && !installerId) return res.status(400).json({ status: false, message: "Select the installer who will perform the site assessment." });
+    if (!installerId) {
+      return res.status(400).json({
+        status: false,
+        message: completedOffline
+          ? "Select the installer who completed the customer's assessment."
+          : "Select the installer who will perform the site assessment.",
+      });
+    }
     const normalizedFee = Number(String(inspectionFeeAmount ?? "").replace(/[^\d.]/g, ""));
     if (!(normalizedFee > 0)) return res.status(400).json({ status: false, message: "Enter the confirmed assessment fee received." });
     const selectedPaymentMethod = paymentMethod === "outright" ? "outright" : "bank-financing";
@@ -3257,13 +3276,21 @@ app.post("/api/sales/projects", requireOperationsAuth, upload.single("quotationF
       }],
       notes: String(notes || ""),
     });
-    let installer = null;
-    if (!completedOffline) {
-      installer = await assignSpecificInstallerToLoanRequest(loanRequest, installerId, salesName);
-      if (!installer) {
-        await LoanRequest.deleteOne({ _id: loanRequest._id });
-        return res.status(409).json({ status: false, message: "The selected installer is no longer available. Refresh and choose another installer." });
-      }
+    const installer = await assignSpecificInstallerToLoanRequest(loanRequest, installerId, salesName, { completedOutsidePortal: completedOffline });
+    if (!installer) {
+      await LoanRequest.deleteOne({ _id: loanRequest._id });
+      return res.status(409).json({
+        status: false,
+        message: completedOffline
+          ? "The selected installer account is no longer active. Refresh and choose another installer."
+          : "The selected installer is no longer available. Refresh and choose another installer.",
+      });
+    }
+    if (completedOffline) {
+      loanRequest.assessment.inspection.completedBy = installer.fullName;
+      loanRequest.assessment.loadAudit.completedBy = installer.fullName;
+      if (acceptedQuotation) loanRequest.assessment.dueDiligence.completedBy = installer.fullName;
+      loanRequest.inspection.assignee = installer.fullName;
     }
     await loanRequest.save();
     let order;
@@ -3335,7 +3362,7 @@ app.post("/api/sales/projects", requireOperationsAuth, upload.single("quotationF
       loanRequest.items = [{ ...loanRequest.items[0].toObject(), name: String(systemDescription).trim(), capacity: String(systemCapacity || "").trim(), price: normalizedQuotationTotal }];
       await loanRequest.save();
     }
-    if (installer) {
+    if (installer && !completedOffline) {
       try { await sendInstallerAssignmentEmail(loanRequest, installer); } catch (mailError) { console.error("SALES ASSIGNMENT EMAIL ERROR:", mailError.message); }
     }
     if (acceptedQuotation) {
@@ -3375,9 +3402,9 @@ app.post("/api/sales/projects", requireOperationsAuth, upload.single("quotationF
     return res.status(201).json({
       status: true,
       message: acceptedQuotation
-        ? `Customer added at quotation-approved stage. An email was sent so they can continue the RichGreen application.`
+        ? `Customer added at quotation-approved stage with ${installer.fullName} recorded as the project installer. An email was sent so the customer can continue the RichGreen application.`
         : completedOffline
-        ? `Customer registered, offline assessment recorded, and order ${order.orderNumber} created.`
+        ? `Customer registered, ${installer.fullName} recorded as the project installer, offline assessment recorded, and order ${order.orderNumber} created.`
         : `Customer registered, payment confirmed, order ${order.orderNumber} created, and site assessment assigned to ${installer.fullName}.`,
       loanRequest,
       order,
@@ -6404,7 +6431,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-11-04-richgreen-continuation-v1",
+    release: "2026-11-05-sales-installer-attribution-v1",
     portalUrl: frontendUrl(),
   });
 });
