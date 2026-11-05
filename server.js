@@ -6497,18 +6497,24 @@ app.post("/api/customer/financing/:id/richgreen-application", requireCustomerAut
     loanRequest.statusHistory.push({ status: loanRequest.status, source: "customer", note: `Customer submitted the RichGreen application for quotation ${quotation.reference}.` });
     await loanRequest.save();
     try {
-      const notificationEmail = process.env.BUILTRIGHT_APPLICATION_EMAIL || process.env.ADMIN_EMAIL || loanRequest.intake?.createdByEmail || "info@builtrightltd.com";
+      const notificationEmail = "builtrightenergy@gmail.com";
+      const applicationPdf = buildRichGreenApplicationPdf(loanRequest, quotation);
       await sendEmail({
         to: notificationEmail,
         subject: `RichGreen application submitted - ${loanRequest.reference}`,
-        html: `<h2>RichGreen customer application submitted</h2><p><strong>Customer:</strong> ${safeHtml(application.fullName)}</p><p><strong>BuiltRight project:</strong> ${safeHtml(loanRequest.reference)}</p><p><strong>Quotation:</strong> ${safeHtml(quotation.reference)}</p><p>The completed application is stored securely. Sign in to the sales portal to download the application PDF and forward it to RichGreen with the approved quotation.</p><p><a href="${frontendUrl()}/sales/projects/${loanRequest._id}">Open customer project</a></p>`,
+        html: `<h2>RichGreen customer application submitted</h2><p><strong>Customer:</strong> ${safeHtml(application.fullName)}</p><p><strong>BuiltRight project:</strong> ${safeHtml(loanRequest.reference)}</p><p><strong>Quotation:</strong> ${safeHtml(quotation.reference)}</p><p>The completed customer application PDF is attached. Download it and forward it to RichGreen together with the approved quotation.</p><p>A secure backup remains available in the sales portal.</p><p><a href="${frontendUrl()}/sales/projects/${loanRequest._id}">Open customer project</a></p>`,
+        attachments: [{
+          filename: `RichGreen-Application-${loanRequest.reference}.pdf`,
+          content: applicationPdf,
+          contentType: "application/pdf",
+        }],
       });
     } catch (mailError) {
       console.error("RICHGREEN APPLICATION NOTIFICATION EMAIL ERROR:", mailError.message);
     }
     return res.json({
       status: true,
-      message: "RichGreen application submitted securely. The sales team can now download it from the portal and forward it to the bank with your approved quotation.",
+      message: "RichGreen application submitted securely and emailed to BuiltRight Energy with the completed PDF attached. A backup remains available in the sales portal.",
       richGreenApplication: { status: "submitted", submittedAt, submittedBy: application.fullName, quotationDocument: quotation._id },
     });
   } catch (error) {
@@ -6658,7 +6664,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-11-05-disbursement-gated-installation-v1",
+    release: "2026-11-05-richgreen-application-email-v1",
     portalUrl: frontendUrl(),
   });
 });
