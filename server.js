@@ -21,6 +21,8 @@ import DeviceCommand from "./models/DeviceCommand.js";
 import ProjectDocument from "./models/ProjectDocument.js";
 import TrainingSettings from "./models/TrainingSettings.js";
 import AdminCredential from "./models/AdminCredential.js";
+import MaintenanceProperty from "./models/MaintenanceProperty.js";
+import MaintenanceRequest from "./models/MaintenanceRequest.js";
 import { accountingRoutes } from "./accounting/routes.js";
 import {
   ASHGRIDX_EVENTS,
@@ -5817,7 +5819,7 @@ app.delete("/api/admin/customers/:id", requireAdminAuth, async (req, res) => {
     }
 
     const customerEmail = String(customer.email || "").toLowerCase();
-    const [loanRequests, devices, orders] = await Promise.all([
+    const [loanRequests, devices, orders, maintenanceProperties] = await Promise.all([
       LoanRequest.find({ "customer.email": customerEmail }).select("_id").lean(),
       Device.find({
         $or: [
@@ -5826,10 +5828,12 @@ app.delete("/api/admin/customers/:id", requireAdminAuth, async (req, res) => {
         ],
       }).select("_id").lean(),
       Order.find({ "customer.email": customerEmail }).select("_id financingRequestId").lean(),
+      MaintenanceProperty.find({ customer: customer._id }).select("_id").lean(),
     ]);
     const loanRequestIds = loanRequests.map((item) => item._id);
     const deviceIds = devices.map((item) => item._id);
     const orderIds = orders.map((item) => item._id);
+    const maintenancePropertyIds = maintenanceProperties.map((item) => item._id);
 
     await Promise.all([
       ProjectDocument.deleteMany({
@@ -5848,12 +5852,19 @@ app.delete("/api/admin/customers/:id", requireAdminAuth, async (req, res) => {
       DeviceCommand.deleteMany({ device: { $in: deviceIds } }),
       DeviceAlert.deleteMany({ device: { $in: deviceIds } }),
       Device.deleteMany({ _id: { $in: deviceIds } }),
+      MaintenanceRequest.deleteMany({
+        $or: [
+          { customer: customer._id },
+          ...(maintenancePropertyIds.length ? [{ property: { $in: maintenancePropertyIds } }] : []),
+        ],
+      }),
+      MaintenanceProperty.deleteMany({ customer: customer._id }),
       User.deleteOne({ _id: customer._id, role: "customer" }),
     ]);
 
     return res.json({
       status: true,
-      message: "Customer and all linked financing, order, document, device, alert, and command records were permanently deleted.",
+      message: "Customer and all linked financing, order, document, device, maintenance, alert, and command records were permanently deleted.",
     });
   } catch (error) {
     console.error("DELETE CUSTOMER ERROR:", error.message);
@@ -5871,7 +5882,7 @@ app.post("/api/admin/reset-operational-data", requireAdminAuth, async (req, res)
       return res.status(400).json({ status: false, message: "Type RESET OPERATIONS to confirm this irreversible reset." });
     }
 
-    const [customers, loanRequests, orders, documents, devices, alerts, commands] = await Promise.all([
+    const [customers, loanRequests, orders, documents, devices, alerts, commands, maintenanceProperties, maintenanceRequests] = await Promise.all([
       User.countDocuments({ role: "customer" }),
       LoanRequest.countDocuments(),
       Order.countDocuments(),
@@ -5879,6 +5890,8 @@ app.post("/api/admin/reset-operational-data", requireAdminAuth, async (req, res)
       Device.countDocuments(),
       DeviceAlert.countDocuments(),
       DeviceCommand.countDocuments(),
+      MaintenanceProperty.countDocuments(),
+      MaintenanceRequest.countDocuments(),
     ]);
 
     await Promise.all([
@@ -5888,13 +5901,15 @@ app.post("/api/admin/reset-operational-data", requireAdminAuth, async (req, res)
       DeviceCommand.deleteMany({}),
       DeviceAlert.deleteMany({}),
       Device.deleteMany({}),
+      MaintenanceRequest.deleteMany({}),
+      MaintenanceProperty.deleteMany({}),
       User.deleteMany({ role: "customer" }),
     ]);
 
     return res.json({
       status: true,
       message: "Operational data reset complete. Products, installers, and admin accounts were preserved.",
-      deleted: { customers, loanRequests, orders, documents, devices, alerts, commands },
+      deleted: { customers, loanRequests, orders, documents, devices, alerts, commands, maintenanceProperties, maintenanceRequests },
     });
   } catch (error) {
     console.error("RESET OPERATIONAL DATA ERROR:", error.message);
@@ -6137,6 +6152,317 @@ app.patch("/api/admin/training-settings", requireAdminAuth, async (req, res) => 
   } catch (error) {
     console.error("UPDATE TRAINING SETTINGS ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not save training settings." });
+  }
+});
+
+/* =========================
+   FACILITY MAINTENANCE
+========================= */
+
+const maintenancePlanServices = {
+  bronze: ["Plumbing services", "Electrical services"],
+  silver: ["Plumbing services", "Electrical services", "Air-conditioning services"],
+  gold: ["Plumbing services", "Electrical services", "Air-conditioning services", "Priority maintenance response"],
+  platinum: ["Custom maintenance scope", "Dedicated support structure", "Priority response and monitoring", "Tailored service coverage"],
+  custom: [],
+};
+
+const maintenanceRequestStatuses = ["submitted", "acknowledged", "team-assigned", "en-route", "in-progress", "resolved", "closed", "cancelled"];
+const maintenanceCategories = ["electrical", "plumbing", "air-conditioning", "fire-safety", "security", "generator", "lift", "building", "other"];
+const dateOrNull = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+app.get("/api/admin/maintenance/overview", requireAdminAuth, async (req, res) => {
+  try {
+    const [properties, requests] = await Promise.all([
+      MaintenanceProperty.find({})
+        .populate("customer", "fullName email phone location isActive")
+        .sort({ updatedAt: -1 })
+        .lean(),
+      MaintenanceRequest.find({})
+        .populate("property", "reference property subscription health")
+        .sort({ createdAt: -1 })
+        .lean(),
+    ]);
+    const openStatuses = new Set(["submitted", "acknowledged", "team-assigned", "en-route", "in-progress"]);
+    return res.json({
+      status: true,
+      stats: {
+        totalProperties: properties.filter((item) => item.isActive).length,
+        activeSubscriptions: properties.filter((item) => item.subscription?.status === "active").length,
+        attentionRequired: properties.filter((item) => ["attention", "critical"].includes(item.health?.status)).length,
+        openRequests: requests.filter((item) => openStatuses.has(item.status)).length,
+        emergencyAlerts: requests.filter((item) => item.requestType === "emergency" && openStatuses.has(item.status)).length,
+      },
+      properties,
+      requests,
+    });
+  } catch (error) {
+    console.error("MAINTENANCE OVERVIEW ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load the maintenance desk." });
+  }
+});
+
+app.post("/api/admin/maintenance/properties", requireAdminAuth, async (req, res) => {
+  try {
+    const customer = await User.findOne({
+      _id: req.body.customerId,
+      role: "customer",
+      isActive: true,
+    }).select("fullName email phone location");
+    if (!customer) return res.status(404).json({ status: false, message: "Select an active customer account." });
+
+    const propertyName = String(req.body.propertyName || "").trim();
+    const address = String(req.body.address || customer.location || "").trim();
+    if (!propertyName || !address) {
+      return res.status(400).json({ status: false, message: "Property name and address are required." });
+    }
+    const plan = Object.prototype.hasOwnProperty.call(maintenancePlanServices, req.body.plan) ? req.body.plan : "bronze";
+    const customServices = Array.isArray(req.body.coveredServices)
+      ? req.body.coveredServices.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    const property = await MaintenanceProperty.create({
+      reference: generateOperationsReference("BRFAC"),
+      customer: customer._id,
+      customerSnapshot: { fullName: customer.fullName, email: customer.email, phone: customer.phone },
+      property: {
+        name: propertyName,
+        type: req.body.propertyType || "other",
+        address,
+        city: String(req.body.city || "Lagos").trim(),
+        state: String(req.body.state || "Lagos").trim(),
+        landmark: String(req.body.landmark || "").trim(),
+        contactPerson: String(req.body.contactPerson || customer.fullName).trim(),
+        contactPhone: String(req.body.contactPhone || customer.phone).trim(),
+      },
+      subscription: {
+        plan,
+        status: req.body.subscriptionStatus || "pending",
+        billingCycle: req.body.billingCycle || "monthly",
+        amount: Math.max(0, Number(req.body.amount || 0)),
+        startsAt: dateOrNull(req.body.startsAt),
+        endsAt: dateOrNull(req.body.endsAt),
+        nextRenewalAt: dateOrNull(req.body.nextRenewalAt),
+        coveredServices: customServices.length ? customServices : maintenancePlanServices[plan],
+        notes: String(req.body.subscriptionNotes || "").trim(),
+      },
+      health: {
+        status: req.body.healthStatus || "assessment-pending",
+        score: Math.min(100, Math.max(0, Number(req.body.healthScore || 0))),
+        summary: String(req.body.healthSummary || "Initial facility assessment is pending.").trim(),
+        lastAssessmentAt: dateOrNull(req.body.lastAssessmentAt),
+        updatedAt: new Date(),
+      },
+      createdBy: req.admin.id,
+    });
+
+    try {
+      await sendEmail({
+        to: customer.email,
+        subject: `Your BuiltRight maintenance portal is ready - ${property.reference}`,
+        html: `<h2>Your facility has been added to BuiltRight Care</h2><p>Hello ${safeHtml(customer.fullName)},</p><p><strong>${safeHtml(property.property.name)}</strong> is now available in your customer portal.</p><p>You can view the property condition, subscription plan, covered services, visits, maintenance requests, and emergency response status.</p><p><a href="${frontendUrl()}/customer/maintenance">Open maintenance portal</a></p>`,
+      });
+    } catch (mailError) {
+      console.error("MAINTENANCE ONBOARDING EMAIL ERROR:", mailError.message);
+    }
+    return res.status(201).json({ status: true, message: "Property added to the maintenance portal.", property });
+  } catch (error) {
+    console.error("CREATE MAINTENANCE PROPERTY ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not add this property." });
+  }
+});
+
+app.patch("/api/admin/maintenance/properties/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const property = await MaintenanceProperty.findById(req.params.id);
+    if (!property) return res.status(404).json({ status: false, message: "Property not found." });
+    const source = req.body || {};
+    if (source.propertyName !== undefined) property.property.name = String(source.propertyName).trim();
+    if (source.address !== undefined) property.property.address = String(source.address).trim();
+    if (source.propertyType !== undefined) property.property.type = source.propertyType;
+    if (source.plan !== undefined && maintenancePlanServices[source.plan]) {
+      property.subscription.plan = source.plan;
+      if (!Array.isArray(source.coveredServices)) property.subscription.coveredServices = maintenancePlanServices[source.plan];
+    }
+    if (source.subscriptionStatus !== undefined) property.subscription.status = source.subscriptionStatus;
+    if (source.billingCycle !== undefined) property.subscription.billingCycle = source.billingCycle;
+    if (source.amount !== undefined) property.subscription.amount = Math.max(0, Number(source.amount || 0));
+    if (source.startsAt !== undefined) property.subscription.startsAt = dateOrNull(source.startsAt);
+    if (source.endsAt !== undefined) property.subscription.endsAt = dateOrNull(source.endsAt);
+    if (source.nextRenewalAt !== undefined) property.subscription.nextRenewalAt = dateOrNull(source.nextRenewalAt);
+    if (Array.isArray(source.coveredServices)) property.subscription.coveredServices = source.coveredServices.map((item) => String(item).trim()).filter(Boolean);
+    if (source.subscriptionNotes !== undefined) property.subscription.notes = String(source.subscriptionNotes).trim();
+    if (source.healthStatus !== undefined) property.health.status = source.healthStatus;
+    if (source.healthScore !== undefined) property.health.score = Math.min(100, Math.max(0, Number(source.healthScore || 0)));
+    if (source.healthSummary !== undefined) property.health.summary = String(source.healthSummary).trim();
+    if (source.lastAssessmentAt !== undefined) property.health.lastAssessmentAt = dateOrNull(source.lastAssessmentAt);
+    if (source.isActive !== undefined) property.isActive = source.isActive === true;
+    property.health.updatedAt = new Date();
+    await property.save();
+    return res.json({ status: true, message: "Property and subscription updated.", property });
+  } catch (error) {
+    console.error("UPDATE MAINTENANCE PROPERTY ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not update this property." });
+  }
+});
+
+app.post("/api/admin/maintenance/properties/:id/visits", requireAdminAuth, async (req, res) => {
+  try {
+    const property = await MaintenanceProperty.findById(req.params.id);
+    if (!property) return res.status(404).json({ status: false, message: "Property not found." });
+    const scheduledFor = dateOrNull(req.body.scheduledFor);
+    if (!scheduledFor) return res.status(400).json({ status: false, message: "Enter a valid visit date and time." });
+    property.visits.push({
+      type: req.body.type || "preventive",
+      scheduledFor,
+      status: "scheduled",
+      summary: String(req.body.summary || "Scheduled maintenance visit").trim(),
+      technician: String(req.body.technician || "BuiltRight maintenance team").trim(),
+    });
+    await property.save();
+    const customer = await User.findById(property.customer).select("fullName email phone").lean();
+    if (customer) {
+      const when = scheduledFor.toLocaleString("en-NG", { dateStyle: "full", timeStyle: "short", timeZone: "Africa/Lagos" });
+      await Promise.allSettled([
+        sendEmail({ to: customer.email, subject: `Maintenance visit scheduled - ${property.reference}`, html: `<h2>Maintenance visit scheduled</h2><p>Hello ${safeHtml(customer.fullName)},</p><p>BuiltRight has scheduled a ${safeHtml(req.body.type || "preventive")} visit for <strong>${safeHtml(property.property.name)}</strong>.</p><p><strong>Date and time:</strong> ${safeHtml(when)}</p><p><strong>Team:</strong> ${safeHtml(req.body.technician || "BuiltRight maintenance team")}</p><p>Track the visit in your <a href="${frontendUrl()}/customer/maintenance">maintenance portal</a>.</p>` }),
+        customer.phone ? sendSms({ to: customer.phone, message: `BuiltRight: Maintenance visit for ${property.property.name} is scheduled for ${when}. Track it at ${frontendUrl()}/customer/maintenance` }) : Promise.resolve(),
+      ]);
+    }
+    return res.status(201).json({ status: true, message: "Maintenance visit scheduled and customer notified.", property });
+  } catch (error) {
+    console.error("SCHEDULE MAINTENANCE VISIT ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not schedule the visit." });
+  }
+});
+
+app.delete("/api/admin/maintenance/properties/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const property = await MaintenanceProperty.findById(req.params.id).select("_id").lean();
+    if (!property) return res.status(404).json({ status: false, message: "Property not found." });
+    await Promise.all([
+      MaintenanceRequest.deleteMany({ property: property._id }),
+      MaintenanceProperty.deleteOne({ _id: property._id }),
+    ]);
+    return res.json({ status: true, message: "Property and its maintenance requests were deleted." });
+  } catch (error) {
+    return res.status(500).json({ status: false, message: "Could not delete this property." });
+  }
+});
+
+app.patch("/api/admin/maintenance/requests/:id", requireAdminAuth, async (req, res) => {
+  try {
+    const request = await MaintenanceRequest.findById(req.params.id);
+    if (!request) return res.status(404).json({ status: false, message: "Maintenance request not found." });
+    const nextStatus = String(req.body.status || request.status);
+    if (!maintenanceRequestStatuses.includes(nextStatus)) {
+      return res.status(400).json({ status: false, message: "Select a valid response status." });
+    }
+    request.status = nextStatus;
+    if (req.body.assignedTeam !== undefined) request.assignedTeam = String(req.body.assignedTeam).trim();
+    if (req.body.responseNote !== undefined) request.responseNote = String(req.body.responseNote).trim();
+    if (nextStatus === "acknowledged" && !request.acknowledgedAt) request.acknowledgedAt = new Date();
+    if (["team-assigned", "en-route"].includes(nextStatus) && !request.dispatchedAt) request.dispatchedAt = new Date();
+    if (["resolved", "closed"].includes(nextStatus) && !request.resolvedAt) request.resolvedAt = new Date();
+    request.timeline.push({
+      status: nextStatus,
+      note: String(req.body.responseNote || `Request moved to ${nextStatus}.`).trim(),
+      source: "admin",
+      actorName: "BuiltRight maintenance desk",
+    });
+    await request.save();
+
+    const customer = await User.findById(request.customer).select("fullName email phone").lean();
+    if (customer) {
+      const statusLabel = nextStatus.replace(/-/g, " ");
+      await Promise.allSettled([
+        sendEmail({ to: customer.email, subject: `Maintenance update ${request.reference} - ${statusLabel}`, html: `<h2>Your maintenance request has been updated</h2><p>Hello ${safeHtml(customer.fullName)},</p><p><strong>${safeHtml(request.reference)}</strong> is now <strong>${safeHtml(statusLabel)}</strong>.</p>${request.assignedTeam ? `<p><strong>Assigned team:</strong> ${safeHtml(request.assignedTeam)}</p>` : ""}${request.responseNote ? `<p><strong>Update:</strong> ${safeHtml(request.responseNote)}</p>` : ""}<p><a href="${frontendUrl()}/customer/maintenance">View live status</a></p>` }),
+        customer.phone ? sendSms({ to: customer.phone, message: `BuiltRight: ${request.reference} is now ${statusLabel}.${request.assignedTeam ? ` Team: ${request.assignedTeam}.` : ""} Track: ${frontendUrl()}/customer/maintenance` }) : Promise.resolve(),
+      ]);
+    }
+    return res.json({ status: true, message: "Response status updated and customer notified.", request });
+  } catch (error) {
+    console.error("UPDATE MAINTENANCE REQUEST ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not update this request." });
+  }
+});
+
+app.get("/api/customer/maintenance", requireCustomerAuth, async (req, res) => {
+  try {
+    const properties = await MaintenanceProperty.find({ customer: req.user.id, isActive: true }).sort({ updatedAt: -1 }).lean();
+    const propertyIds = properties.map((item) => item._id);
+    const requests = await MaintenanceRequest.find({ customer: req.user.id, property: { $in: propertyIds } }).sort({ createdAt: -1 }).lean();
+    return res.json({ status: true, properties, requests });
+  } catch (error) {
+    console.error("CUSTOMER MAINTENANCE ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not load your maintenance portal." });
+  }
+});
+
+const createCustomerMaintenanceRequest = async ({ req, requestType }) => {
+  const property = await MaintenanceProperty.findOne({ _id: req.body.propertyId, customer: req.user.id, isActive: true });
+  if (!property) {
+    const error = new Error("Select one of the properties connected to your account.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const customer = await User.findOne({ _id: req.user.id, role: "customer", isActive: true }).select("fullName email phone").lean();
+  const title = String(req.body.title || (requestType === "emergency" ? "Emergency assistance required" : "Maintenance service request")).trim();
+  const description = String(req.body.description || "").trim();
+  if (!description) {
+    const error = new Error("Describe the fault or emergency so the response team can prepare.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const category = maintenanceCategories.includes(req.body.category) ? req.body.category : "other";
+  return MaintenanceRequest.create({
+    reference: generateOperationsReference(requestType === "emergency" ? "BREMR" : "BRMNT"),
+    property: property._id,
+    customer: customer._id,
+    customerSnapshot: { fullName: customer.fullName, email: customer.email, phone: customer.phone },
+    requestType,
+    category,
+    priority: requestType === "emergency" ? "emergency" : (req.body.priority || "normal"),
+    status: "submitted",
+    title,
+    description,
+    locationWithinProperty: String(req.body.locationWithinProperty || "").trim(),
+    safeToRemainOnSite: req.body.safeToRemainOnSite !== false,
+    timeline: [{ status: "submitted", note: requestType === "emergency" ? "Emergency alert triggered by customer." : "Service request submitted by customer.", source: "customer", actorName: customer.fullName }],
+  });
+};
+
+app.post("/api/customer/maintenance/requests", requireCustomerAuth, async (req, res) => {
+  try {
+    const request = await createCustomerMaintenanceRequest({ req, requestType: "service" });
+    const alertEmail = process.env.MAINTENANCE_ALERT_EMAIL || process.env.ADMIN_EMAIL || "builtrightenergy@gmail.com";
+    await Promise.allSettled([
+      sendEmail({ to: alertEmail, subject: `New maintenance request ${request.reference}`, html: `<h2>New customer maintenance request</h2><p><strong>Customer:</strong> ${safeHtml(request.customerSnapshot.fullName)}</p><p><strong>Category:</strong> ${safeHtml(request.category)}</p><p><strong>Issue:</strong> ${safeHtml(request.description)}</p><p><a href="${frontendUrl()}/admin/maintenance">Open maintenance desk</a></p>` }),
+      sendEmail({ to: request.customerSnapshot.email, subject: `Maintenance request received - ${request.reference}`, html: `<h2>We received your request</h2><p>Your reference is <strong>${safeHtml(request.reference)}</strong>. The BuiltRight maintenance desk will update the response status in your portal.</p><p><a href="${frontendUrl()}/customer/maintenance">Track request</a></p>` }),
+    ]);
+    return res.status(201).json({ status: true, message: "Maintenance request submitted. You can track every response in this portal.", request });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ status: false, message: error.message || "Could not submit the maintenance request." });
+  }
+});
+
+app.post("/api/customer/maintenance/emergency", requireCustomerAuth, async (req, res) => {
+  try {
+    const request = await createCustomerMaintenanceRequest({ req, requestType: "emergency" });
+    const alertEmail = process.env.MAINTENANCE_ALERT_EMAIL || process.env.ADMIN_EMAIL || "builtrightenergy@gmail.com";
+    const alertPhone = process.env.MAINTENANCE_ALERT_PHONE || "09134991239";
+    const alertMessage = `EMERGENCY ${request.reference}: ${request.customerSnapshot.fullName}, ${request.category}. ${request.locationWithinProperty || "Property location in portal"}. Open ${frontendUrl()}/admin/maintenance`;
+    await Promise.allSettled([
+      sendEmail({ to: alertEmail, subject: `URGENT: Facility emergency ${request.reference}`, html: `<div style="font-family:Arial,sans-serif;border-top:6px solid #B32127;padding:20px"><h1 style="color:#B32127">Emergency facility alert</h1><p><strong>Reference:</strong> ${safeHtml(request.reference)}</p><p><strong>Customer:</strong> ${safeHtml(request.customerSnapshot.fullName)}</p><p><strong>Phone:</strong> ${safeHtml(request.customerSnapshot.phone)}</p><p><strong>Category:</strong> ${safeHtml(request.category)}</p><p><strong>Location on site:</strong> ${safeHtml(request.locationWithinProperty || "Not stated")}</p><p><strong>Safe to remain on site:</strong> ${request.safeToRemainOnSite ? "Yes" : "No"}</p><p><strong>Description:</strong> ${safeHtml(request.description)}</p><p><a href="${frontendUrl()}/admin/maintenance">Open emergency response desk</a></p></div>` }),
+      sendSms({ to: alertPhone, message: alertMessage }),
+      sendEmail({ to: request.customerSnapshot.email, subject: `Emergency alert received - ${request.reference}`, html: `<h2>Your emergency alert is active</h2><p>Reference: <strong>${safeHtml(request.reference)}</strong></p><p>BuiltRight has been alerted. Keep people away from immediate danger, switch off affected equipment only when it is safe, and contact public emergency services where life or property is at immediate risk.</p><p><a href="${frontendUrl()}/customer/maintenance">Track response</a></p>` }),
+      request.customerSnapshot.phone ? sendSms({ to: request.customerSnapshot.phone, message: `BuiltRight: Emergency alert ${request.reference} received. Track response in your portal. For immediate danger, contact the appropriate public emergency service.` }) : Promise.resolve(),
+    ]);
+    return res.status(201).json({ status: true, message: `Emergency alert ${request.reference} triggered. BuiltRight has been notified by email and SMS.`, request });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ status: false, message: error.message || "Could not trigger the emergency alert." });
   }
 });
 
