@@ -39,6 +39,13 @@ const userSchema = new mongoose.Schema(
       enum: ["customer", "admin", "installer", "learner", "accountant", "sales"],
       default: "customer",
     },
+    serviceInterest: {
+      type: String,
+      enum: ["financing", "maintenance"],
+      default: function defaultCustomerService() {
+        return this.role === "customer" ? "financing" : undefined;
+      },
+    },
     isActive: {
       type: Boolean,
       default: true,

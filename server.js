@@ -2044,12 +2044,18 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { fullName, email, phone, location, password } = req.body;
+    const { fullName, email, phone, location, password, serviceInterest } = req.body;
 
     if (!fullName || !email || !phone || !password) {
       return res.status(400).json({
         status: false,
         message: "Full name, email, phone, and password are required.",
+      });
+    }
+    if (!['financing', 'maintenance'].includes(serviceInterest)) {
+      return res.status(400).json({
+        status: false,
+        message: "Choose Solar & Financing or Facility Maintenance before creating your account.",
       });
     }
 
@@ -2071,6 +2077,7 @@ app.post("/api/auth/register", async (req, res) => {
       location: location || "",
       password: hashedPassword,
       role: "customer",
+      serviceInterest,
     });
 
     const token = createToken({
@@ -2083,8 +2090,17 @@ app.post("/api/auth/register", async (req, res) => {
       await sendEmail({
         to: user.email,
         subject: "Welcome to BuiltRight Services",
-        html: `<h2>Welcome to BuiltRight Services Ltd</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your account has been created successfully. You can now request solar financing, receive quotations, review invoices, and track your project from your customer profile.</p><p><a href="${frontendUrl()}/customer/dashboard">Open my BuiltRight profile</a></p>`,
+        html: serviceInterest === "maintenance"
+          ? `<h2>Welcome to BuiltRight Facility Care</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your customer account has been created successfully. BuiltRight will complete a site inspection and due diligence before confirming any remediation and beginning the paid three-month probationary maintenance period.</p><p><a href="${frontendUrl()}/customer/maintenance">Open my Facility Care profile</a></p>`
+          : `<h2>Welcome to BuiltRight Energy</h2><p>Hello ${safeHtml(user.fullName)},</p><p>Your account has been created successfully. You can now request solar financing, receive quotations, review invoices, and track your project from your customer profile.</p><p><a href="${frontendUrl()}/customer/dashboard">Open my BuiltRight profile</a></p>`,
       });
+      if (serviceInterest === "maintenance") {
+        await sendEmail({
+          to: process.env.MAINTENANCE_ALERT_EMAIL || process.env.ADMIN_EMAIL || "builtrightenergy@gmail.com",
+          subject: `New facility maintenance sign-up - ${user.fullName}`,
+          html: `<h2>New maintenance customer sign-up</h2><p><strong>Customer:</strong> ${safeHtml(user.fullName)}</p><p><strong>Email:</strong> ${safeHtml(user.email)}</p><p><strong>Phone:</strong> ${safeHtml(user.phone)}</p><p><strong>Location:</strong> ${safeHtml(user.location || "Not provided")}</p><p>Contact the customer to arrange the site inspection and due diligence, then add the property from the <a href="${frontendUrl()}/admin/maintenance">maintenance desk</a>.</p>`,
+        });
+      }
     } catch (mailError) {
       console.error("CUSTOMER WELCOME EMAIL ERROR:", mailError.message);
     }
@@ -2100,7 +2116,9 @@ app.post("/api/auth/register", async (req, res) => {
         phone: user.phone,
         location: user.location,
         role: user.role,
+        serviceInterest: user.serviceInterest,
       },
+      nextPath: user.serviceInterest === "maintenance" ? "/customer/maintenance" : "/customer/dashboard",
     });
   } catch (error) {
     console.error("REGISTER ERROR:", error.message);
@@ -2165,7 +2183,9 @@ app.post("/api/auth/login", async (req, res) => {
         phone: user.phone,
         location: user.location,
         role: user.role,
+        serviceInterest: user.serviceInterest || "financing",
       },
+      nextPath: user.serviceInterest === "maintenance" ? "/customer/maintenance" : "/customer/dashboard",
     });
   } catch (error) {
     console.error("LOGIN ERROR:", error.message);
