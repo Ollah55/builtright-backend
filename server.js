@@ -6169,10 +6169,16 @@ const maintenancePlanServices = {
 
 const maintenanceRequestStatuses = ["submitted", "acknowledged", "team-assigned", "en-route", "in-progress", "resolved", "closed", "cancelled"];
 const maintenanceCategories = ["electrical", "plumbing", "air-conditioning", "fire-safety", "security", "generator", "lift", "building", "other"];
+const maintenanceOnboardingStages = ["site-inspection-pending", "site-inspection-scheduled", "due-diligence-in-progress", "remediation-required", "remediation-in-progress", "remediation-completed", "probation-payment-due", "probation-active", "probation-review", "contract-active", "terminated"];
 const dateOrNull = (value) => {
   if (!value) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+};
+const addThreeCalendarMonths = (value) => {
+  const result = new Date(value);
+  result.setMonth(result.getMonth() + 3);
+  return result;
 };
 
 app.get("/api/admin/maintenance/overview", requireAdminAuth, async (req, res) => {
@@ -6192,7 +6198,7 @@ app.get("/api/admin/maintenance/overview", requireAdminAuth, async (req, res) =>
       status: true,
       stats: {
         totalProperties: properties.filter((item) => item.isActive).length,
-        activeSubscriptions: properties.filter((item) => item.subscription?.status === "active").length,
+        activeSubscriptions: properties.filter((item) => ["probation", "active"].includes(item.subscription?.status)).length,
         attentionRequired: properties.filter((item) => ["attention", "critical"].includes(item.health?.status)).length,
         openRequests: requests.filter((item) => openStatuses.has(item.status)).length,
         emergencyAlerts: requests.filter((item) => item.requestType === "emergency" && openStatuses.has(item.status)).length,
@@ -6240,7 +6246,7 @@ app.post("/api/admin/maintenance/properties", requireAdminAuth, async (req, res)
       },
       subscription: {
         plan,
-        status: req.body.subscriptionStatus || "pending",
+        status: "pending",
         billingCycle: req.body.billingCycle || "monthly",
         amount: Math.max(0, Number(req.body.amount || 0)),
         startsAt: dateOrNull(req.body.startsAt),
@@ -6255,6 +6261,11 @@ app.post("/api/admin/maintenance/properties", requireAdminAuth, async (req, res)
         summary: String(req.body.healthSummary || "Initial facility assessment is pending.").trim(),
         lastAssessmentAt: dateOrNull(req.body.lastAssessmentAt),
         updatedAt: new Date(),
+      },
+      onboarding: {
+        stage: "site-inspection-pending",
+        remediation: { required: false, status: "not-assessed" },
+        probation: { paymentStatus: "pending", amount: 0, nonRefundable: true, outcome: "pending" },
       },
       createdBy: req.admin.id,
     });
@@ -6295,6 +6306,58 @@ app.patch("/api/admin/maintenance/properties/:id", requireAdminAuth, async (req,
     if (source.nextRenewalAt !== undefined) property.subscription.nextRenewalAt = dateOrNull(source.nextRenewalAt);
     if (Array.isArray(source.coveredServices)) property.subscription.coveredServices = source.coveredServices.map((item) => String(item).trim()).filter(Boolean);
     if (source.subscriptionNotes !== undefined) property.subscription.notes = String(source.subscriptionNotes).trim();
+    if (source.inspectionScheduledAt !== undefined) property.onboarding.inspection.scheduledAt = dateOrNull(source.inspectionScheduledAt);
+    if (source.inspectionCompletedAt !== undefined) property.onboarding.inspection.completedAt = dateOrNull(source.inspectionCompletedAt);
+    if (source.inspectionFindings !== undefined) property.onboarding.inspection.findings = String(source.inspectionFindings).trim();
+    if (source.dueDiligenceNotes !== undefined) property.onboarding.inspection.dueDiligenceNotes = String(source.dueDiligenceNotes).trim();
+    if (source.remediationRequired !== undefined) property.onboarding.remediation.required = source.remediationRequired === true;
+    if (source.remediationStatus !== undefined) property.onboarding.remediation.status = source.remediationStatus;
+    if (source.remediationScope !== undefined) property.onboarding.remediation.scope = String(source.remediationScope).trim();
+    if (source.remediationCompletedAt !== undefined) property.onboarding.remediation.completedAt = dateOrNull(source.remediationCompletedAt);
+    if (source.probationPaymentStatus !== undefined) property.onboarding.probation.paymentStatus = source.probationPaymentStatus;
+    if (source.probationAmount !== undefined) property.onboarding.probation.amount = Math.max(0, Number(source.probationAmount || 0));
+    if (source.probationPaidAt !== undefined) property.onboarding.probation.paidAt = dateOrNull(source.probationPaidAt);
+    if (source.probationStartsAt !== undefined) {
+      property.onboarding.probation.startsAt = dateOrNull(source.probationStartsAt);
+      property.onboarding.probation.endsAt = property.onboarding.probation.startsAt ? addThreeCalendarMonths(property.onboarding.probation.startsAt) : null;
+    }
+    if (source.probationOutcome !== undefined) property.onboarding.probation.outcome = source.probationOutcome;
+    if (source.probationReviewNotes !== undefined) property.onboarding.probation.reviewNotes = String(source.probationReviewNotes).trim();
+    if (source.onboardingStage !== undefined) {
+      if (!maintenanceOnboardingStages.includes(source.onboardingStage)) {
+        return res.status(400).json({ status: false, message: "Select a valid maintenance onboarding stage." });
+      }
+      if (source.onboardingStage === "probation-active") {
+        if (!property.onboarding.inspection.completedAt) {
+          return res.status(409).json({ status: false, message: "Complete the site inspection and due diligence before starting probation." });
+        }
+        if (!["not-required", "completed"].includes(property.onboarding.remediation.status)) {
+          return res.status(409).json({ status: false, message: "Any required remediation must be completed before probation can start." });
+        }
+        if (property.onboarding.probation.paymentStatus !== "paid" || property.onboarding.probation.amount <= 0) {
+          return res.status(409).json({ status: false, message: "Confirm full payment for the non-refundable three-month probation before activation." });
+        }
+        if (!property.onboarding.probation.startsAt) {
+          return res.status(409).json({ status: false, message: "Set the probation start date before activation." });
+        }
+        property.subscription.status = "probation";
+      }
+      if (source.onboardingStage === "contract-active") {
+        if (!property.onboarding.probation.endsAt || property.onboarding.probation.endsAt > new Date()) {
+          return res.status(409).json({ status: false, message: "The full three-month probation must finish before the continuing contract is activated." });
+        }
+        if (property.onboarding.probation.outcome !== "continue") {
+          return res.status(409).json({ status: false, message: "Record the probation outcome as Continue before activating the contract." });
+        }
+        property.subscription.status = "active";
+        property.onboarding.contractActivatedAt ||= new Date();
+      }
+      if (source.onboardingStage === "terminated") {
+        property.subscription.status = "cancelled";
+        property.onboarding.terminatedAt ||= new Date();
+      }
+      property.onboarding.stage = source.onboardingStage;
+    }
     if (source.healthStatus !== undefined) property.health.status = source.healthStatus;
     if (source.healthScore !== undefined) property.health.score = Math.min(100, Math.max(0, Number(source.healthScore || 0)));
     if (source.healthSummary !== undefined) property.health.summary = String(source.healthSummary).trim();
@@ -6322,6 +6385,10 @@ app.post("/api/admin/maintenance/properties/:id/visits", requireAdminAuth, async
       summary: String(req.body.summary || "Scheduled maintenance visit").trim(),
       technician: String(req.body.technician || "BuiltRight maintenance team").trim(),
     });
+    if ((req.body.type || "preventive") === "inspection") {
+      property.onboarding.stage = "site-inspection-scheduled";
+      property.onboarding.inspection.scheduledAt = scheduledFor;
+    }
     await property.save();
     const customer = await User.findById(property.customer).select("fullName email phone").lean();
     if (customer) {
@@ -6990,7 +7057,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-11-05-richgreen-income-field-v1",
+    release: "2026-11-25-maintenance-contract-v1",
     portalUrl: frontendUrl(),
   });
 });
