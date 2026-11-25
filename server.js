@@ -23,6 +23,7 @@ import TrainingSettings from "./models/TrainingSettings.js";
 import AdminCredential from "./models/AdminCredential.js";
 import MaintenanceProperty from "./models/MaintenanceProperty.js";
 import MaintenanceRequest from "./models/MaintenanceRequest.js";
+import { activeMaintenanceTechnician, resolveMaintenanceTechnician } from "./utils/maintenanceTechnician.js";
 import { accountingRoutes } from "./accounting/routes.js";
 import {
   ASHGRIDX_EVENTS,
@@ -6189,6 +6190,15 @@ const maintenancePlanServices = {
 
 const maintenanceRequestStatuses = ["submitted", "acknowledged", "team-assigned", "en-route", "in-progress", "resolved", "closed", "cancelled"];
 const maintenanceCategories = ["electrical", "plumbing", "air-conditioning", "fire-safety", "security", "generator", "lift", "building", "other"];
+const maintenanceTechnicianPopulation = {
+  path: "assignedTechnician",
+  select: "fullName",
+  match: activeMaintenanceTechnician,
+};
+const getMaintenanceTechnician = (id) => resolveMaintenanceTechnician(
+  id,
+  (filter) => User.findOne(filter).select("_id").lean()
+);
 const maintenanceOnboardingStages = ["site-inspection-pending", "site-inspection-scheduled", "due-diligence-in-progress", "remediation-required", "remediation-in-progress", "remediation-completed", "probation-payment-due", "probation-active", "probation-review", "contract-active", "terminated"];
 const dateOrNull = (value) => {
   if (!value) return null;
@@ -6203,15 +6213,17 @@ const addThreeCalendarMonths = (value) => {
 
 app.get("/api/admin/maintenance/overview", requireAdminAuth, async (req, res) => {
   try {
-    const [properties, requests] = await Promise.all([
+    const [properties, requests, technicians] = await Promise.all([
       MaintenanceProperty.find({})
         .populate("customer", "fullName email phone location isActive")
+        .populate(maintenanceTechnicianPopulation)
         .sort({ updatedAt: -1 })
         .lean(),
       MaintenanceRequest.find({})
         .populate("property", "reference property subscription health")
         .sort({ createdAt: -1 })
         .lean(),
+      User.find(activeMaintenanceTechnician).select("fullName").sort({ fullName: 1 }).lean(),
     ]);
     const openStatuses = new Set(["submitted", "acknowledged", "team-assigned", "en-route", "in-progress"]);
     return res.json({
@@ -6225,6 +6237,7 @@ app.get("/api/admin/maintenance/overview", requireAdminAuth, async (req, res) =>
       },
       properties,
       requests,
+      technicians,
     });
   } catch (error) {
     console.error("MAINTENANCE OVERVIEW ERROR:", error.message);
@@ -6246,6 +6259,7 @@ app.post("/api/admin/maintenance/properties", requireAdminAuth, async (req, res)
     if (!propertyName || !address) {
       return res.status(400).json({ status: false, message: "Property name and address are required." });
     }
+    const assignedTechnician = await getMaintenanceTechnician(req.body.technicianId ?? null);
     const plan = Object.prototype.hasOwnProperty.call(maintenancePlanServices, req.body.plan) ? req.body.plan : "bronze";
     const customServices = Array.isArray(req.body.coveredServices)
       ? req.body.coveredServices.map((item) => String(item).trim()).filter(Boolean)
@@ -6253,6 +6267,7 @@ app.post("/api/admin/maintenance/properties", requireAdminAuth, async (req, res)
     const property = await MaintenanceProperty.create({
       reference: generateOperationsReference("BRFAC"),
       customer: customer._id,
+      assignedTechnician,
       customerSnapshot: { fullName: customer.fullName, email: customer.email, phone: customer.phone },
       property: {
         name: propertyName,
@@ -6301,8 +6316,29 @@ app.post("/api/admin/maintenance/properties", requireAdminAuth, async (req, res)
     }
     return res.status(201).json({ status: true, message: "Property added to the maintenance portal.", property });
   } catch (error) {
+    if (error.statusCode === 400) return res.status(400).json({ status: false, message: error.message });
     console.error("CREATE MAINTENANCE PROPERTY ERROR:", error.message);
     return res.status(500).json({ status: false, message: "Could not add this property." });
+  }
+});
+
+app.patch("/api/admin/maintenance/properties/:id/technician", requireAdminAuth, async (req, res) => {
+  try {
+    if (!mongoose.isObjectIdOrHexString(req.params.id)) {
+      return res.status(404).json({ status: false, message: "Property not found." });
+    }
+    const assignedTechnician = await getMaintenanceTechnician(req.body?.technicianId);
+    const property = await MaintenanceProperty.findByIdAndUpdate(
+      req.params.id,
+      { $set: { assignedTechnician } },
+      { new: true }
+    ).select("assignedTechnician").populate(maintenanceTechnicianPopulation).lean();
+    if (!property) return res.status(404).json({ status: false, message: "Property not found." });
+    return res.json({ status: true, assignedTechnician: property.assignedTechnician, message: assignedTechnician ? "Technician assigned to this address." : "Technician removed from this address." });
+  } catch (error) {
+    if (error.statusCode === 400) return res.status(400).json({ status: false, message: error.message });
+    console.error("ASSIGN MAINTENANCE TECHNICIAN ERROR:", error.message);
+    return res.status(500).json({ status: false, message: "Could not update the assigned technician." });
   }
 });
 
@@ -6478,7 +6514,9 @@ app.patch("/api/admin/maintenance/requests/:id", requireAdminAuth, async (req, r
 
 app.get("/api/customer/maintenance", requireCustomerAuth, async (req, res) => {
   try {
-    const properties = await MaintenanceProperty.find({ customer: req.user.id, isActive: true }).sort({ updatedAt: -1 }).lean();
+    const properties = await MaintenanceProperty.find({ customer: req.user.id, isActive: true })
+      .populate({ ...maintenanceTechnicianPopulation, transform: (technician) => technician ? { fullName: technician.fullName } : null })
+      .sort({ updatedAt: -1 }).lean();
     const propertyIds = properties.map((item) => item._id);
     const requests = await MaintenanceRequest.find({ customer: req.user.id, property: { $in: propertyIds } }).sort({ createdAt: -1 }).lean();
     return res.json({ status: true, properties, requests });
@@ -7077,7 +7115,7 @@ app.get("/api/test", (req, res) => {
   res.json({
     status: true,
     message: "API WORKS",
-    release: "2026-11-25-maintenance-contract-v1",
+    release: "2026-11-25-maintenance-technician-v1",
     portalUrl: frontendUrl(),
   });
 });

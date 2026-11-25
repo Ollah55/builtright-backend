@@ -36,6 +36,7 @@ const maintenancePropertySchema = new mongoose.Schema(
   {
     reference: { type: String, required: true, unique: true, index: true },
     customer: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    assignedTechnician: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     customerSnapshot: {
       fullName: { type: String, default: "" },
       email: { type: String, default: "", lowercase: true },
